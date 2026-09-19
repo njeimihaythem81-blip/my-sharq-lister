@@ -34,9 +34,14 @@ st.set_page_config(page_title=APP_NAME, page_icon="🫒", layout="wide")
 
 MASTER_DIR = "master_data"
 MASTER_FILE_PATH = os.path.join(MASTER_DIR, "master_list.xlsx")
-MODEL_NAME = "gemini-3.5-flash-lite"  # free-tier-eligible Gemini model
-MAX_MASTER_ROWS_SENT_TO_LLM = 400  # keeps requests inside the model's context
+MODEL_NAME = "gemini-3.5-flash-lite"  # gemini-2.5-flash-lite was retired for new users
 MAX_FILE_SIZE_MB = 20  # Gemini's own inline-file limit
+
+# Fuzzy-match score thresholds (0-100) used when comparing an extracted
+# item against every row of the master list locally in Python.
+MATCH_HIGH_THRESHOLD = 90
+MATCH_MEDIUM_THRESHOLD = 75
+MATCH_LOW_THRESHOLD = 60  # below this, treated as "no match"
 
 os.makedirs(MASTER_DIR, exist_ok=True)
 
@@ -260,16 +265,13 @@ def read_guest_file_as_parts(uploaded_file):
 # Talking to the LLM
 # --------------------------------------------------------------------------
 
-def build_master_context(master_df: pd.DataFrame) -> str:
-    """Turn the master list into CSV text to give the LLM as reference data."""
-    trimmed = master_df.head(MAX_MASTER_ROWS_SENT_TO_LLM)
-    return trimmed.to_csv(index=False)
-
-
-def call_llm_for_matching(client, guest_parts, master_csv: str):
+def extract_items_from_file(client, guest_parts):
     """
-    Send the guest's file plus the master list to Gemini, and get back a
-    structured JSON list of extracted items matched to master rows.
+    Ask Gemini to read the guest's file and extract every distinct piece of
+    equipment mentioned, with its quantity if given. This step never sees
+    the master list at all - matching against it happens afterward, locally
+    in Python (see match_items_to_master), so this works no matter how many
+    rows the master list has.
     Raises a plain Exception with a human-readable message on failure.
     """
     from google.genai import types
@@ -277,32 +279,21 @@ def call_llm_for_matching(client, guest_parts, master_csv: str):
     system_prompt = (
         "You read equipment requests that may be handwritten, scanned, typed, "
         "or contained in a document, written in Arabic, English, or French. "
-        "Extract every distinct piece of equipment mentioned, together with its "
-        "requested quantity if one is given. Then match each extracted item to "
-        "the single closest entry in the MASTER LIST below, using meaning rather "
-        "than exact spelling (the request may be in a different language than "
-        "the master list, abbreviated, or misspelled). If an item has no "
-        "reasonable match in the master list, say so instead of guessing.\n\n"
+        "Extract every distinct piece of equipment mentioned, together with "
+        "its requested quantity if one is given.\n\n"
         "Respond with a JSON array. Each array element must look like this:\n"
         "{\n"
-        '  "extracted_text": "the item as it appeared in the request",\n'
+        '  "extracted_text": "the item exactly as it appeared in the '
+        'request (its code, name, or description)",\n'
         '  "detected_language": "Arabic" | "English" | "French" | "Other",\n'
-        '  "quantity": "quantity found, or empty string if none was given",\n'
-        '  "matched_master_row": { ...every column from the matching master '
-        "row, copied exactly... } or null if nothing matches well,\n"
-        '  "confidence": "High" | "Medium" | "Low",\n'
-        '  "notes": "anything the reviewer should double check"\n'
-        "}\n\n"
-        f"MASTER LIST (CSV format):\n{master_csv}"
+        '  "quantity": "quantity found, or empty string if none was given"\n'
+        "}"
     )
 
     contents = list(guest_parts)
     contents.append(
         types.Part.from_text(
-            text=(
-                "Extract the equipment items from this file and match them to "
-                "the master list exactly as instructed in the system prompt."
-            )
+            text="Extract the equipment items from this file exactly as instructed."
         )
     )
 
@@ -340,6 +331,62 @@ def call_llm_for_matching(client, guest_parts, master_csv: str):
             "Please try again."
         )
     return parsed
+
+
+# --------------------------------------------------------------------------
+# Matching extracted items against the master list, entirely locally
+# --------------------------------------------------------------------------
+
+def match_items_to_master(extracted_items, master_df: pd.DataFrame):
+    """
+    For each item the AI extracted, find the best-matching row anywhere in
+    the master list using fuzzy text matching, searching every column of
+    every row. This never calls the AI and never truncates the master
+    list, so it works correctly whether the list has 20 rows or 20,000.
+    """
+    from rapidfuzz import fuzz, process
+
+    filled = master_df.fillna("").astype(str)
+    row_texts = filled.agg(" ".join, axis=1).tolist()
+
+    results = []
+    for item in extracted_items:
+        query = str(item.get("extracted_text", "")).strip()
+        matched_row = None
+        confidence = "Low"
+        notes = ""
+
+        match = None
+        if query and row_texts:
+            match = process.extractOne(query, row_texts, scorer=fuzz.token_set_ratio)
+
+        if match is not None:
+            _, score, idx = match
+            if score >= MATCH_LOW_THRESHOLD:
+                matched_row = master_df.iloc[idx].to_dict()
+                if score >= MATCH_HIGH_THRESHOLD:
+                    confidence = "High"
+                elif score >= MATCH_MEDIUM_THRESHOLD:
+                    confidence = "Medium"
+                else:
+                    confidence = "Low"
+                    notes = "Best available match was not very close; please double-check."
+            else:
+                notes = "No sufficiently close match found in the master list."
+        else:
+            notes = "No sufficiently close match found in the master list."
+
+        results.append(
+            {
+                "extracted_text": item.get("extracted_text", ""),
+                "detected_language": item.get("detected_language", ""),
+                "quantity": item.get("quantity", ""),
+                "matched_master_row": matched_row,
+                "confidence": confidence,
+                "notes": notes,
+            }
+        )
+    return results
 
 
 # --------------------------------------------------------------------------
@@ -432,9 +479,11 @@ with tab_guest:
                         st.error(file_error)
                     else:
                         client = get_gemini_client()
-                        master_csv = build_master_context(master_df)
-                        results = call_llm_for_matching(
-                            client, guest_parts, master_csv
+                        extracted_items = extract_items_from_file(
+                            client, guest_parts
+                        )
+                        results = match_items_to_master(
+                            extracted_items, master_df
                         )
                         result_df = results_to_dataframe(results)
 
