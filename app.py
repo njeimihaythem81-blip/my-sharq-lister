@@ -34,7 +34,7 @@ st.set_page_config(page_title=APP_NAME, page_icon="🫒", layout="wide")
 
 MASTER_DIR = "master_data"
 MASTER_FILE_PATH = os.path.join(MASTER_DIR, "master_list.xlsx")
-MODEL_NAME = "gemini-2.5-flash-lite"  # free-tier-eligible Gemini model
+MODEL_NAME = "gemini-3.5-flash-lite"  # free-tier-eligible Gemini model
 MAX_MASTER_ROWS_SENT_TO_LLM = 400  # keeps requests inside the model's context
 MAX_FILE_SIZE_MB = 20  # Gemini's own inline-file limit
 
