@@ -1,0 +1,16 @@
+[theme]
+# Pistachio green accent (buttons, active tab, sliders, checkboxes)
+primaryColor = "#8FBC6F"
+# Clear, light grey page background
+backgroundColor = "#F2F2EF"
+# Slightly deeper grey for input boxes / sidebar panels
+secondaryBackgroundColor = "#E3E3DE"
+# Black text throughout
+textColor = "#111111"
+font = "sans serif"
+
+[server]
+# Reject uploads over 20MB at the server level, matching the Gemini API's
+# own inline-file limit, so oversized files fail fast with a clear message
+# instead of a confusing API error later.
+maxUploadSize = 20
