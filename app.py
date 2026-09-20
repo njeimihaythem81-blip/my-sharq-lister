@@ -16,6 +16,7 @@ See the README.md that comes with this app for full setup and
 deployment instructions.
 """
 
+import base64
 import io
 import json
 import os
@@ -23,6 +24,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -63,6 +65,18 @@ PISTACHIO_DARK = "#6FA24F"
 GREY_BG = "#F2F2EF"
 GREY_PANEL = "#E3E3DE"
 BLACK = "#111111"
+
+APP_TAGLINE = "Your sharp assistant for optimizing orders from scratch."
+
+# The business's real "SEC" badge, cropped directly from their own supplied
+# logo photo (not redrawn), kept at its native resolution and embedded
+# inline as base64 so no external image file or hosting is needed. Source
+# is only 55x55px, so it's used small and crisp in the header; as the
+# larger background watermark it will look a little soft since it's being
+# scaled up from a small source - send a higher-resolution logo file later
+# if a sharper large watermark is wanted.
+LOGO_IMAGE_B64 = "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"
+LOGO_IMAGE_URI = f"data:image/png;base64,{LOGO_IMAGE_B64}"
 
 
 def apply_branding():
@@ -134,18 +148,129 @@ def apply_branding():
                 background-color: white;
                 border-radius: 8px;
             }}
+            .app-tagline {{
+                margin: 0 0 0.25rem 2.6rem;
+                font-size: 0.95rem;
+                font-style: italic;
+                color: #333333;
+            }}
+            .app-bg-logo {{
+                position: fixed;
+                bottom: -40px;
+                right: -40px;
+                width: 190px;
+                height: 190px;
+                opacity: 0.07;
+                z-index: 0;
+                pointer-events: none;
+            }}
+            .app-bg-logo img {{
+                width: 100%;
+                height: 100%;
+                image-rendering: -webkit-optimize-contrast;
+            }}
+            .app-header-logo {{
+                width: 40px;
+                height: 40px;
+                border-radius: 8px;
+            }}
+            @keyframes statusBlink {{
+                0%, 100% {{ opacity: 1; }}
+                50% {{ opacity: 0.3; }}
+            }}
+            .status-blink {{
+                color: {PISTACHIO_DARK};
+                font-weight: 700;
+                font-size: 1.05rem;
+                padding: 0.4rem 0;
+                animation: statusBlink 1.1s ease-in-out infinite;
+            }}
         </style>
+        <div class="app-bg-logo"><img src="{LOGO_IMAGE_URI}" alt=""/></div>
         <div class="app-header">
-            <span style="font-size:2rem;">🫒</span>
+            <img class="app-header-logo" src="{LOGO_IMAGE_URI}" alt="SEC logo"/>
             <p class="app-header-title">{APP_NAME}</p>
             <span class="app-header-badge">Equipment Matcher</span>
         </div>
+        <p class="app-tagline">{APP_TAGLINE}</p>
         """,
         unsafe_allow_html=True,
     )
 
 
 apply_branding()
+
+
+def render_blinking_status(placeholder, message: str):
+    """Show a pulsing green status line in the given st.empty() placeholder."""
+    placeholder.markdown(
+        f'<div class="status-blink">{message}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_whatsapp_share_button(excel_bytes: bytes, filename: str):
+    """
+    Render a button that shares the results Excel file straight through
+    the device's native share sheet, so the guest can pick WhatsApp and
+    send the actual file directly (not just a link). Works on modern
+    mobile browsers (Web Share API with files); on browsers that don't
+    support this (mainly desktop), it falls back to opening a plain
+    WhatsApp chat with a text message instead, since a file can't be
+    attached through a wa.me link.
+    """
+    b64 = base64.b64encode(excel_bytes).decode("utf-8")
+    mime = (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    fallback_text = (
+        "I have matched equipment results ready - please download them "
+        "from the app; I'll send the file separately."
+    )
+    html = f"""
+    <button id="wa-share-btn" style="
+        background-color:{PISTACHIO};
+        color:{BLACK};
+        border:1px solid {PISTACHIO_DARK};
+        font-weight:700;
+        border-radius:8px;
+        padding:0.5rem 1rem;
+        cursor:pointer;
+        font-size:1rem;
+        width:100%;
+    ">Send via WhatsApp</button>
+    <script>
+        const b64 = "{b64}";
+        const btn = document.getElementById("wa-share-btn");
+        function openFallback() {{
+            const msg = encodeURIComponent("{fallback_text}");
+            window.open("https://wa.me/?text=" + msg, "_blank");
+        }}
+        btn.addEventListener("click", async () => {{
+            try {{
+                const byteChars = atob(b64);
+                const byteNumbers = new Array(byteChars.length);
+                for (let i = 0; i < byteChars.length; i++) {{
+                    byteNumbers[i] = byteChars.charCodeAt(i);
+                }}
+                const byteArray = new Uint8Array(byteNumbers);
+                const file = new File([byteArray], "{filename}", {{ type: "{mime}" }});
+                if (navigator.canShare && navigator.canShare({{ files: [file] }})) {{
+                    await navigator.share({{
+                        files: [file],
+                        title: "Matched Equipment Results",
+                        text: "Matched equipment results attached.",
+                    }});
+                }} else {{
+                    openFallback();
+                }}
+            }} catch (err) {{
+                openFallback();
+            }}
+        }});
+    </script>
+    """
+    components.html(html, height=55)
 
 
 # --------------------------------------------------------------------------
@@ -627,57 +752,71 @@ with tab_guest:
         )
 
         if guest_upload is not None and st.button("Process Request"):
-            with st.spinner("Reading your file and matching items..."):
-                try:
-                    guest_parts, file_error = read_guest_file_as_parts(guest_upload)
-                    if file_error:
-                        st.error(file_error)
-                    else:
-                        client = get_gemini_client()
-                        master_csv, was_truncated = build_master_context(
-                            master_df
+            status_placeholder = st.empty()
+            try:
+                render_blinking_status(status_placeholder, "Loading file...")
+                guest_parts, file_error = read_guest_file_as_parts(guest_upload)
+                if file_error:
+                    status_placeholder.empty()
+                    st.error(file_error)
+                else:
+                    client = get_gemini_client()
+                    master_csv, was_truncated = build_master_context(master_df)
+                    if was_truncated:
+                        st.warning(
+                            f"The master list has more than "
+                            f"{MAX_MASTER_ROWS_SENT_TO_LLM} rows; only "
+                            "the first "
+                            f"{MAX_MASTER_ROWS_SENT_TO_LLM} were used "
+                            "for matching."
                         )
-                        if was_truncated:
-                            st.warning(
-                                f"The master list has more than "
-                                f"{MAX_MASTER_ROWS_SENT_TO_LLM} rows; only "
-                                "the first "
-                                f"{MAX_MASTER_ROWS_SENT_TO_LLM} were used "
-                                "for matching."
-                            )
-                        aliases_csv = build_aliases_context(load_aliases_df())
-                        results = call_llm_for_matching(
-                            client,
-                            guest_parts,
-                            master_csv,
-                            aliases_csv,
-                            load_assumptions(),
-                        )
-                        result_df = results_to_dataframe(results)
+                    aliases_csv = build_aliases_context(load_aliases_df())
 
-                        st.success(f"Found {len(result_df)} item(s).")
-                        st.dataframe(result_df)
+                    render_blinking_status(
+                        status_placeholder, "Identification in process..."
+                    )
+                    results = call_llm_for_matching(
+                        client,
+                        guest_parts,
+                        master_csv,
+                        aliases_csv,
+                        load_assumptions(),
+                    )
+                    status_placeholder.empty()
 
-                        excel_bytes = df_to_excel_bytes(result_df)
+                    result_df = results_to_dataframe(results)
+
+                    st.success(f"Found {len(result_df)} item(s).")
+                    st.dataframe(result_df)
+
+                    excel_bytes = df_to_excel_bytes(result_df)
+                    excel_filename = (
+                        "matched_equipment_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    )
+                    col_download, col_whatsapp = st.columns(2)
+                    with col_download:
                         st.download_button(
                             "Download Results as Excel",
                             data=excel_bytes,
-                            file_name=(
-                                "matched_equipment_"
-                                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                            ),
+                            file_name=excel_filename,
                             mime=(
                                 "application/vnd.openxmlformats-"
                                 "officedocument.spreadsheetml.sheet"
                             ),
                         )
-                except json.JSONDecodeError:
-                    st.error(
-                        "The AI's response could not be read as structured data. "
-                        "Please try again; if it keeps happening, try a clearer "
-                        "photo or a shorter file."
-                    )
-                except RuntimeError as e:
-                    st.error(str(e))
-                except Exception as e:
-                    st.error(f"Something went wrong: {e}")
+                    with col_whatsapp:
+                        render_whatsapp_share_button(excel_bytes, excel_filename)
+            except json.JSONDecodeError:
+                status_placeholder.empty()
+                st.error(
+                    "The AI's response could not be read as structured data. "
+                    "Please try again; if it keeps happening, try a clearer "
+                    "photo or a shorter file."
+                )
+            except RuntimeError as e:
+                status_placeholder.empty()
+                st.error(str(e))
+            except Exception as e:
+                status_placeholder.empty()
+                st.error(f"Something went wrong: {e}")
