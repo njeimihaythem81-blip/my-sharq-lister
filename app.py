@@ -20,6 +20,7 @@ import base64
 import io
 import json
 import os
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -462,124 +463,52 @@ def build_aliases_context(aliases_df):
     return aliases_df.to_csv(index=False)
 
 
-def call_llm_for_matching(
-    client, guest_parts, master_csv: str, aliases_csv=None, assumptions: str = ""
-):
+def extract_items_from_file(client, guest_parts):
     """
-    Send the guest's file plus the ENTIRE master list to Gemini in one
-    call, and ask it to both extract the requested items and match each
-    one using genuine understanding - not literal text overlap. It can
-    bridge languages (an Arabic or French description matching an
-    English-coded row), resolve abbreviations and technical synonyms, and
-    use domain knowledge of electrical/industrial equipment (phase count,
-    power rating, voltage, frame size, etc.) to judge whether a loosely
-    worded description plausibly refers to a specific catalog row - the
-    way an experienced parts-counter clerk would.
-
-    If aliases_csv is given (the admin's custom term dictionary), those
-    mappings are treated as trusted ground truth and take priority over
-    the AI's own judgment whenever an extracted item matches one closely.
-
-    If assumptions is given (free text the admin wrote, e.g. about the
-    typical supply voltage/phase used), it's used as the basis for any
-    electrical unit conversions (kW <-> A) needed to bridge a request
-    that states power rather than current, or vice versa.
+    Ask Gemini to read the guest's file and extract every distinct piece
+    of equipment mentioned, with its quantity if given. This step never
+    sees the master list or term dictionary at all - those are applied
+    afterward by resolve_items() - so extraction stays fast and focused.
     Raises a plain Exception with a human-readable message on failure.
     """
     from google.genai import types
 
-    aliases_section = ""
-    if aliases_csv:
-        aliases_section = (
-            "\n\nKNOWN TERM MAPPINGS (trusted ground truth - written by the "
-            "business that owns this master list). If an extracted item "
-            "matches one of these terms closely (in any of the supported "
-            "languages, even loosely worded or misspelled), always prefer "
-            "the mapped item(s) over your own independent guess. The "
-            "mapped value uses a simple wildcard convention with '*':\n"
-            "- No '*' at all (e.g. 'S72M200'): names one specific "
-            "master-list row directly - use it as the match, High "
-            "confidence.\n"
-            "- Trailing '*' (e.g. 'A9F791*'): a PRODUCT FAMILY of every "
-            "row whose code STARTS WITH that text.\n"
-            "- Leading '*' (e.g. '*25'): a PRODUCT FAMILY of every row "
-            "whose code ENDS WITH that text.\n"
-            "- '*' on both ends (e.g. '*25*'): a PRODUCT FAMILY of every "
-            "row whose code CONTAINS that text anywhere.\n"
-            "For any family match, pick whichever specific row in that "
-            "family best fits any further details in the extracted item "
-            "(size, pole count, amperage, rating, etc.); if the request "
-            "gives no way to narrow it down further, pick the most "
-            "plausible single row from the family and explain the choice "
-            "briefly in the notes field.\n\n"
-            f"{aliases_csv}"
-        )
-
-    conversion_section = (
-        "\n\nUNIT CONVERSION: requests sometimes state a motor/device's "
-        "power (kW or HP) while the catalog codes by rated current (A), or "
-        "the other way around. You may bridge this using standard "
-        "electrical engineering knowledge (the usual three-phase formula "
-        "I = P / (sqrt(3) x V x power factor x efficiency), typical "
-        "assumed power factor/efficiency for induction motors, and common "
-        "manufacturer AC-3 motor-starter selection tables for this kind of "
-        "equipment) rather than only literal text matching."
-    )
-    if assumptions.strip():
-        conversion_section += (
-            "\n\nBUSINESS ASSUMPTIONS (use these defaults unless the "
-            f"request clearly states otherwise):\n{assumptions.strip()}"
-        )
-    else:
-        conversion_section += (
-            " If the request doesn't state voltage/phase and no business "
-            "default is given, state the assumption you used in the notes "
-            "field so it can be double-checked."
-        )
-
     system_prompt = (
-        "You are an expert equipment-catalog clerk. You read equipment "
-        "requests that may be handwritten, scanned, typed, or contained in "
-        "a document, written in Arabic, English, or French - sometimes as "
-        "precise part codes, sometimes as loose or indirect descriptions "
-        "(a translated term, a partial spec, or a description of what the "
-        "item does, its size, or its rating rather than its exact code).\n\n"
-        "Step 1: Extract every distinct piece of equipment mentioned, "
+        "You read equipment requests that may be handwritten, scanned, "
+        "typed, or contained in a document, written in Arabic, English, or "
+        "French. Extract every distinct piece of equipment mentioned, "
         "together with its requested quantity if one is given.\n\n"
-        "Step 2: For each extracted item, find the single best-matching "
-        "row in the MASTER LIST below. Use real understanding, not just "
-        "literal text overlap: match across languages, resolve "
-        "abbreviations and technical synonyms, and use your domain "
-        "knowledge of electrical/industrial equipment to judge whether a "
-        "loosely worded description plausibly refers to a specific "
-        "catalog row. If no row is a reasonable match, say so rather than "
-        "guessing."
-        f"{aliases_section}"
-        f"{conversion_section}\n\n"
+        "IMPORTANT - quantity vs. spec numbers: Arabic order lists mix "
+        "right-to-left Arabic text with numerals and abbreviations that "
+        "render left-to-right, and a single line very often contains MORE "
+        "THAN ONE number. Only one of them is the quantity being "
+        "requested; the others are technical specifications that belong "
+        "to the item's own description (a current/amperage rating, a "
+        "size in mm, a voltage, a model or reference number). A number "
+        "immediately attached to a unit or rating word (e.g. 'امبير', "
+        "'Amp', 'A', 'mm', 'V', 'kW', or a code like 'DPN 25') is part of "
+        "the description, NOT the quantity - keep it inside "
+        "extracted_text. The quantity is normally the one remaining "
+        "standalone number in the line with no unit attached, and it can "
+        "appear before or after the item description depending on how "
+        "the line was written. Never output extracted_text as a bare "
+        "number by itself with no item description - if that's about to "
+        "happen, re-read the line: the description was likely misread as "
+        "the quantity or dropped entirely.\n\n"
         "Respond with a JSON array. Each array element must look like "
         "this:\n"
         "{\n"
-        '  "extracted_text": "the item as it appeared in the request",\n'
+        '  "extracted_text": "the item exactly as it appeared in the '
+        'request (its code, name, or full description)",\n'
         '  "detected_language": "Arabic" | "English" | "French" | "Other",\n'
-        '  "quantity": "quantity found, or empty string if none was given",\n'
-        '  "matched_master_row": { ...every column from the matching '
-        "master row, copied exactly... } or null if nothing matches "
-        "well,\n"
-        '  "confidence": "High" | "Medium" | "Low",\n'
-        '  "notes": "brief reasoning for the match (or why nothing '
-        'matched), especially useful when confidence is not High"\n'
-        "}\n\n"
-        f"MASTER LIST (CSV format, every row is a candidate):\n{master_csv}"
+        '  "quantity": "quantity found, or empty string if none was given"\n'
+        "}"
     )
 
     contents = list(guest_parts)
     contents.append(
         types.Part.from_text(
-            text=(
-                "Extract the equipment items from this file and match each "
-                "one to the master list using real understanding, exactly "
-                "as instructed in the system prompt."
-            )
+            text="Extract the equipment items from this file exactly as instructed."
         )
     )
 
@@ -617,6 +546,427 @@ def call_llm_for_matching(
             "Please try again."
         )
     return parsed
+
+
+# --------------------------------------------------------------------------
+# Deterministic term-dictionary resolution (pure Python, no AI involved)
+# --------------------------------------------------------------------------
+
+def _parse_wildcard_pattern(pattern: str):
+    """Return (core_text, mode) for a term-dictionary mapping value."""
+    p = pattern.strip()
+    starts_star = p.startswith("*")
+    ends_star = p.endswith("*")
+    core = p.strip("*")
+    if starts_star and ends_star:
+        return core, "contains"
+    if ends_star:
+        return core, "prefix"
+    if starts_star:
+        return core, "suffix"
+    return core, "exact"
+
+
+def _value_matches(value: str, core: str, mode: str) -> bool:
+    v = str(value).strip().lower()
+    c = core.strip().lower()
+    if not c:
+        return False
+    if mode == "exact":
+        return v == c
+    if mode == "prefix":
+        return v.startswith(c)
+    if mode == "suffix":
+        return v.endswith(c)
+    if mode == "contains":
+        return c in v
+    return False
+
+
+def resolve_alias_family(pattern: str, master_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Deterministically find every master-list row matching a term-dictionary
+    mapping value (an exact code, or a '*' wildcard family pattern),
+    checking every column of every row. Pure pandas - no AI call, so this
+    is 100% guaranteed to apply the admin's rule exactly as written,
+    regardless of how large the master list is.
+    """
+    core, mode = _parse_wildcard_pattern(pattern)
+    if not core:
+        return master_df.iloc[0:0]
+    filled = master_df.fillna("").astype(str)
+    mask = filled.apply(
+        lambda row: any(_value_matches(v, core, mode) for v in row), axis=1
+    )
+    return master_df[mask]
+
+
+def find_alias_matches(extracted_text: str, aliases_df):
+    """
+    Return every term-dictionary row whose Term appears as a substring of
+    the extracted item's text (case-insensitive). Uses the first two
+    columns positionally, regardless of their exact header names.
+    """
+    if aliases_df is None or aliases_df.empty or aliases_df.shape[1] < 2:
+        return []
+    text_lower = str(extracted_text).lower()
+    term_col = aliases_df.columns[0]
+    match_col = aliases_df.columns[1]
+    hits = []
+    for _, row in aliases_df.iterrows():
+        term = str(row[term_col]).strip()
+        if term and term.lower() in text_lower:
+            hits.append({"term": term, "pattern": str(row[match_col]).strip()})
+    return _dedupe_hits_by_specificity(hits)
+
+
+def _dedupe_hits_by_specificity(hits):
+    """
+    When multiple dictionary terms match the same item, and one matched
+    term is itself a substring of another matched term (e.g. "تاكو" is
+    contained within "تاكو مضغوط"), the longer/more specific term almost
+    certainly reflects what the admin meant, so it silently wins over the
+    shorter, more general term it contains - this is NOT treated as a
+    conflict. Only genuinely independent terms (neither contains the
+    other) remain as a real conflict needing the AI/admin to resolve.
+    """
+    if len(hits) <= 1:
+        return hits
+    kept = []
+    for h in hits:
+        term_lower = h["term"].lower()
+        subsumed = any(
+            other is not h
+            and len(other["term"]) > len(h["term"])
+            and term_lower in other["term"].lower()
+            for other in hits
+        )
+        if not subsumed:
+            kept.append(h)
+    return kept
+
+
+# --------------------------------------------------------------------------
+# AI-based matching for whatever the term dictionary doesn't fully resolve
+# --------------------------------------------------------------------------
+
+def call_llm_for_item_matching(
+    client, items_for_ai, master_csv: str, aliases_csv=None, assumptions: str = ""
+):
+    """
+    Match a list of already-extracted items against the master list using
+    genuine understanding - not literal text overlap. Each item may carry
+    an optional "hint" (a term-dictionary family constraint, or a conflict
+    warning) that must be followed as a hard instruction for that item.
+    Raises a plain Exception with a human-readable message on failure.
+    """
+    from google.genai import types
+
+    aliases_section = ""
+    if aliases_csv:
+        aliases_section = (
+            "\n\nKNOWN TERM MAPPINGS (context only - most of these were "
+            "already applied deterministically before this step; they're "
+            "repeated here only so you understand the business's "
+            "vocabulary for any item that still needs your judgment):\n"
+            f"{aliases_csv}"
+        )
+
+    conversion_section = (
+        "\n\nUNIT CONVERSION: requests sometimes state a motor/device's "
+        "power (kW or HP) while the catalog codes by rated current (A), or "
+        "the other way around. You may bridge this using standard "
+        "electrical engineering knowledge (the usual three-phase formula "
+        "I = P / (sqrt(3) x V x power factor x efficiency), typical "
+        "assumed power factor/efficiency for induction motors, and common "
+        "manufacturer AC-3 motor-starter selection tables for this kind of "
+        "equipment) rather than only literal text matching."
+    )
+    if assumptions.strip():
+        conversion_section += (
+            "\n\nBUSINESS ASSUMPTIONS (use these defaults unless the "
+            f"request clearly states otherwise):\n{assumptions.strip()}"
+        )
+    else:
+        conversion_section += (
+            " If the request doesn't state voltage/phase and no business "
+            "default is given, state the assumption you used in the notes "
+            "field so it can be double-checked."
+        )
+
+    system_prompt = (
+        "You are an expert equipment-catalog clerk. Below is a JSON list "
+        "of ALREADY-EXTRACTED items (extracted_text, detected_language, "
+        "quantity). Some items include a \"hint\" field - if present, "
+        "treat it as a HARD constraint specific to that item and follow "
+        "it precisely (it may restrict you to a small list of candidate "
+        "rows, or flag a conflict you must resolve and explain).\n\n"
+        "For each item, find the single best-matching row in the MASTER "
+        "LIST below (or, if a hint gives its own candidate list, choose "
+        "only from that list). Use real understanding, not just literal "
+        "text overlap: match across languages, resolve abbreviations and "
+        "technical synonyms, and use your domain knowledge of "
+        "electrical/industrial equipment to judge whether a loosely "
+        "worded description plausibly refers to a specific catalog row. "
+        "If no row is a reasonable match, say so rather than guessing."
+        f"{aliases_section}"
+        f"{conversion_section}\n\n"
+        "Respond with a JSON array, exactly one element per input item, "
+        "IN THE SAME ORDER as the input list. Each element must look like "
+        "this:\n"
+        "{\n"
+        '  "extracted_text": "copied from the input item",\n'
+        '  "detected_language": "copied from the input item",\n'
+        '  "quantity": "copied from the input item",\n'
+        '  "matched_master_row": { ...every column from the matching '
+        "master row, copied exactly... } or null if nothing matches "
+        "well,\n"
+        '  "confidence": "High" | "Medium" | "Low",\n'
+        '  "notes": "brief reasoning for the match (or why nothing '
+        'matched, or how a conflict was resolved)"\n'
+        "}\n\n"
+        f"ITEMS TO MATCH (JSON):\n"
+        f"{json.dumps(items_for_ai, ensure_ascii=False)}\n\n"
+        f"MASTER LIST (CSV format, every row is a candidate):\n{master_csv}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                types.Part.from_text(
+                    text="Match these items exactly as instructed in the system prompt."
+                )
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as e:
+        msg = str(e)
+        if "RESOURCE_EXHAUSTED" in msg or "429" in msg or "quota" in msg.lower():
+            raise RuntimeError(
+                "The free Gemini usage limit was reached. Please wait a "
+                "minute (or try again tomorrow if the daily limit was hit) "
+                "and try again."
+            ) from e
+        raise RuntimeError(f"The AI service returned an error: {msg}") from e
+
+    raw_text = getattr(response, "text", None)
+    if not raw_text:
+        raise RuntimeError(
+            "The AI returned an empty response. This can happen if the "
+            "file's content was blocked by a safety filter, or was too "
+            "unclear to read. Please try a clearer file."
+        )
+
+    parsed = json.loads(raw_text)
+    if not isinstance(parsed, list):
+        raise RuntimeError(
+            "The AI's response wasn't in the expected list format. "
+            "Please try again."
+        )
+    return parsed
+
+
+def _expand_kit_pattern(pattern: str):
+    """
+    Split a term-dictionary mapping value into (sub_pattern, multiplier)
+    pairs. A comma or semicolon separates multiple codes/families that
+    should all be added together as a kit/bundle whenever the term is
+    matched - each part may optionally end with ':<number>' to give that
+    component its own per-kit-unit quantity (default 1 if omitted), e.g.
+    'S72M200:1, A9F79106:3, LC1D32M7:2' means one kit needs 1 of the
+    first item, 3 of the second, and 2 of the third; these multipliers
+    are then multiplied by the guest's requested quantity for the term.
+    A plain single value with no comma (e.g. 'A9F791*') is just a normal
+    one-item mapping, returned as a single (pattern, 1) pair.
+    """
+    parts = re.split(r"[,;]", pattern)
+    result = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if ":" in p:
+            sub, _, qty_str = p.rpartition(":")
+            sub = sub.strip()
+            try:
+                multiplier = float(qty_str.strip())
+                if multiplier == int(multiplier):
+                    multiplier = int(multiplier)
+            except ValueError:
+                multiplier = 1
+        else:
+            sub, multiplier = p, 1
+        if sub:
+            result.append((sub, multiplier))
+    return result
+
+
+def _compute_component_quantity(requested_quantity, multiplier):
+    """
+    Multiply the guest's requested quantity by a kit component's per-unit
+    multiplier (e.g. requested 2 kits x 3 breakers/kit = 6 breakers).
+    Falls back gracefully if the requested quantity isn't a clean number.
+    """
+    try:
+        base = float(str(requested_quantity).strip())
+    except (ValueError, TypeError):
+        return f"{multiplier} per unit (requested quantity unclear: '{requested_quantity}')"
+    total = base * multiplier
+    if total == int(total):
+        total = int(total)
+    return str(total)
+
+
+def resolve_items(client, extracted_items, master_df, aliases_df, master_csv, assumptions):
+    """
+    Combine deterministic term-dictionary resolution (guaranteed, no AI
+    needed) with AI-based matching for whatever the dictionary doesn't
+    fully resolve on its own:
+    - One dictionary term matches a single code/family with exactly one
+      candidate row -> resolved directly in Python, High confidence, no
+      AI call for that item at all.
+    - One dictionary term matches a KIT (multiple codes/families
+      separated by ',' or ';', each optionally with ':multiplier') -> the
+      item expands into one result row per component, each with its own
+      quantity (requested quantity x that component's multiplier).
+    - A kit component (or a plain single mapping) names a family with
+      several candidates -> the AI picks the best one, but constrained to
+      ONLY that family (passed as a per-item hint), rather than the whole
+      master list.
+    - More than one dictionary term matches the same item (a genuine
+      conflict) -> flagged to the AI to resolve and explain, rather than
+      silently guessing.
+    - No dictionary term matches -> falls back to full AI matching against
+      the whole master list, same as before.
+    This guarantees dictionary rules always take effect exactly as
+    written, instead of depending on the AI reliably recalling a rule
+    buried inside a very long master-list prompt.
+    """
+    pending = []  # list of {"kind": "resolved", "result": {...}} or {"kind": "ai", "payload": {...}}
+
+    def add_resolved(text, language, quantity, row, confidence, notes):
+        pending.append(
+            {
+                "kind": "resolved",
+                "result": {
+                    "extracted_text": text,
+                    "detected_language": language,
+                    "quantity": quantity,
+                    "matched_master_row": row,
+                    "confidence": confidence,
+                    "notes": notes,
+                },
+            }
+        )
+
+    def add_ai(item_dict, hint):
+        ai_item = dict(item_dict)
+        ai_item["hint"] = hint
+        pending.append({"kind": "ai", "payload": ai_item})
+
+    for item in extracted_items:
+        text = item.get("extracted_text", "")
+        language = item.get("detected_language", "")
+        requested_qty = item.get("quantity", "")
+        hits = find_alias_matches(text, aliases_df)
+
+        if len(hits) == 1:
+            term = hits[0]["term"]
+            components = _expand_kit_pattern(hits[0]["pattern"])
+            is_kit = len(components) > 1
+
+            for sub_pattern, multiplier in components:
+                component_qty = (
+                    _compute_component_quantity(requested_qty, multiplier)
+                    if is_kit
+                    else requested_qty
+                )
+                kit_note = (
+                    f' (kit component of "{term}", {multiplier} per unit)'
+                    if is_kit
+                    else ""
+                )
+                candidates = resolve_alias_family(sub_pattern, master_df)
+
+                if len(candidates) == 1:
+                    row = candidates.iloc[0].to_dict()
+                    add_resolved(
+                        text,
+                        language,
+                        component_qty,
+                        row,
+                        "High",
+                        f'Matched via your term dictionary ("{term}" -> '
+                        f"{sub_pattern}){kit_note}.",
+                    )
+                elif len(candidates) > 1:
+                    hint = (
+                        f'Your term dictionary maps "{term}" to the family '
+                        f'"{sub_pattern}"{kit_note}. You MUST choose '
+                        "matched_master_row from ONLY these candidate rows "
+                        "(CSV), based on any further details in this item "
+                        "(size, rating, pole count, etc.); if nothing "
+                        "narrows it down further, pick the most plausible "
+                        "one and say so in notes:\n"
+                        + candidates.to_csv(index=False)
+                    )
+                    item_for_ai = dict(item)
+                    item_for_ai["quantity"] = component_qty
+                    add_ai(item_for_ai, hint)
+                else:
+                    add_resolved(
+                        text,
+                        language,
+                        component_qty,
+                        None,
+                        "Low",
+                        f'Your term dictionary maps "{term}" to '
+                        f'"{sub_pattern}"{kit_note}, but no master-list row '
+                        "matches that - please check the mapping.",
+                    )
+            continue
+
+        elif len(hits) > 1:
+            conflict_desc = "; ".join(
+                f'"{h["term"]}" -> {h["pattern"]}' for h in hits
+            )
+            hint = (
+                "CONFLICT: more than one term-dictionary rule applies to "
+                f"this single item ({conflict_desc}). Pick whichever rule "
+                "is more specific to this item's actual description, "
+                "apply it, and clearly state in notes that a conflict "
+                "occurred and which rule was applied."
+            )
+            add_ai(item, hint)
+            continue
+
+        else:
+            add_ai(item, None)
+
+    ai_entries = [p for p in pending if p["kind"] == "ai"]
+    if ai_entries:
+        items_payload = []
+        for p in ai_entries:
+            payload = p["payload"]
+            if payload.get("hint") is None:
+                payload = {k: v for k, v in payload.items() if k != "hint"}
+            items_payload.append(payload)
+        ai_results = call_llm_for_item_matching(
+            client, items_payload, master_csv, build_aliases_context(aliases_df), assumptions
+        )
+        if len(ai_results) != len(ai_entries):
+            raise RuntimeError(
+                "The AI returned a different number of results than "
+                "expected. Please try again."
+            )
+        for entry, result in zip(ai_entries, ai_results):
+            entry["result"] = result
+
+    return [p["result"] for p in pending]
 
 
 # --------------------------------------------------------------------------
@@ -682,16 +1032,26 @@ with tab_admin:
         st.subheader("Optional - Custom Term Dictionary")
         st.caption(
             "Teach the app specific words or phrases that should always "
-            "point to a particular item, in any supported language. Prepare "
-            "a simple Excel file with two columns: the term/phrase in the "
-            "first column, and the matching value from your master list in "
-            "the second column - an exact code (e.g. 'S72M200') for one "
-            "specific item, or use '*' as a wildcard for a whole family of "
-            "items: 'A9F791*' = codes starting with that, '*25' = codes "
-            "ending with that, '*25*' = codes containing that anywhere. "
-            "The AI then picks the best specific item within a family "
-            "using the rest of the request's details. These mappings are "
-            "trusted as ground truth and override the AI's own guess."
+            "point to a particular item (or a whole kit of items), in any "
+            "supported language. Prepare a simple Excel file with two "
+            "columns: the term/phrase in the first column, and the "
+            "matching value from your master list in the second - "
+            "resolved automatically in code (not left to the AI's memory), "
+            "so it always applies exactly as written:\n"
+            "- Exact code (e.g. 'S72M200') -> that one specific item.\n"
+            "- Wildcard family with '*': 'A9F791*' = codes starting with "
+            "that, '*25' = ending with that, '*25*' = containing that "
+            "anywhere. If a family has several candidates, the AI picks "
+            "the best specific one from that family only.\n"
+            "- Kit/bundle: separate several codes/families with a comma, "
+            "each optionally followed by ':multiplier' (default 1), e.g. "
+            "'S72M200:1, A9F79106:3, LC1D32M7:2' -> requesting this term "
+            "adds all three items at once, each with its own quantity "
+            "(the guest's requested quantity x that component's "
+            "multiplier).\n"
+            "- Overlapping terms: if a longer term contains a shorter one "
+            "(e.g. 'تاكو مضغوط' contains 'تاكو'), the longer, more "
+            "specific term wins automatically."
         )
         aliases_upload = st.file_uploader(
             "Upload term dictionary (.xls or .xlsx)",
@@ -770,16 +1130,18 @@ with tab_guest:
                             f"{MAX_MASTER_ROWS_SENT_TO_LLM} were used "
                             "for matching."
                         )
-                    aliases_csv = build_aliases_context(load_aliases_df())
+                    aliases_df = load_aliases_df()
 
                     render_blinking_status(
                         status_placeholder, "Identification in process..."
                     )
-                    results = call_llm_for_matching(
+                    extracted_items = extract_items_from_file(client, guest_parts)
+                    results = resolve_items(
                         client,
-                        guest_parts,
+                        extracted_items,
+                        master_df,
+                        aliases_df,
                         master_csv,
-                        aliases_csv,
                         load_assumptions(),
                     )
                     status_placeholder.empty()
