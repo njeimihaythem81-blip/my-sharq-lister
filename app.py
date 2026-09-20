@@ -34,6 +34,8 @@ st.set_page_config(page_title=APP_NAME, page_icon="🫒", layout="wide")
 
 MASTER_DIR = "master_data"
 MASTER_FILE_PATH = os.path.join(MASTER_DIR, "master_list.xlsx")
+ALIASES_FILE_PATH = os.path.join(MASTER_DIR, "aliases.xlsx")
+ASSUMPTIONS_FILE_PATH = os.path.join(MASTER_DIR, "assumptions.txt")
 MODEL_NAME = "gemini-3.5-flash-lite"  # gemini-2.5-flash-lite was retired for new users
 MAX_FILE_SIZE_MB = 20  # Gemini's own inline-file limit
 
@@ -205,6 +207,48 @@ def save_master_file(uploaded_file):
 
 
 # --------------------------------------------------------------------------
+# Custom term dictionary storage (optional)
+# --------------------------------------------------------------------------
+
+def load_aliases_df():
+    """Load the previously-saved custom term dictionary, if one exists."""
+    if os.path.exists(ALIASES_FILE_PATH):
+        try:
+            return pd.read_excel(ALIASES_FILE_PATH)
+        except Exception as e:
+            st.error(f"Could not read the saved term dictionary: {e}")
+            return None
+    return None
+
+
+def save_aliases_file(uploaded_file):
+    """Persist the admin's uploaded term dictionary to disk."""
+    with open(ALIASES_FILE_PATH, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+
+# --------------------------------------------------------------------------
+# Business assumptions storage (optional free text)
+# --------------------------------------------------------------------------
+
+def load_assumptions() -> str:
+    """Load the admin's saved business assumptions text, if any."""
+    if os.path.exists(ASSUMPTIONS_FILE_PATH):
+        try:
+            with open(ASSUMPTIONS_FILE_PATH, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def save_assumptions(text: str):
+    """Persist the admin's business assumptions text to disk."""
+    with open(ASSUMPTIONS_FILE_PATH, "w", encoding="utf-8") as f:
+        f.write(text.strip())
+
+
+# --------------------------------------------------------------------------
 # Reading the guest's file into a format Gemini can understand
 # --------------------------------------------------------------------------
 
@@ -281,7 +325,21 @@ def build_master_context(master_df: pd.DataFrame) -> tuple[str, bool]:
     return trimmed.to_csv(index=False), was_truncated
 
 
-def call_llm_for_matching(client, guest_parts, master_csv: str):
+def build_aliases_context(aliases_df):
+    """
+    Turn the optional custom term dictionary into CSV text, or None if no
+    dictionary has been uploaded. Column names are kept exactly as the
+    admin wrote them (e.g. "Term" / "Correct Match"), since the AI just
+    reads them as labeled examples rather than a fixed schema.
+    """
+    if aliases_df is None or aliases_df.empty:
+        return None
+    return aliases_df.to_csv(index=False)
+
+
+def call_llm_for_matching(
+    client, guest_parts, master_csv: str, aliases_csv=None, assumptions: str = ""
+):
     """
     Send the guest's file plus the ENTIRE master list to Gemini in one
     call, and ask it to both extract the requested items and match each
@@ -292,9 +350,67 @@ def call_llm_for_matching(client, guest_parts, master_csv: str):
     power rating, voltage, frame size, etc.) to judge whether a loosely
     worded description plausibly refers to a specific catalog row - the
     way an experienced parts-counter clerk would.
+
+    If aliases_csv is given (the admin's custom term dictionary), those
+    mappings are treated as trusted ground truth and take priority over
+    the AI's own judgment whenever an extracted item matches one closely.
+
+    If assumptions is given (free text the admin wrote, e.g. about the
+    typical supply voltage/phase used), it's used as the basis for any
+    electrical unit conversions (kW <-> A) needed to bridge a request
+    that states power rather than current, or vice versa.
     Raises a plain Exception with a human-readable message on failure.
     """
     from google.genai import types
+
+    aliases_section = ""
+    if aliases_csv:
+        aliases_section = (
+            "\n\nKNOWN TERM MAPPINGS (trusted ground truth - written by the "
+            "business that owns this master list). If an extracted item "
+            "matches one of these terms closely (in any of the supported "
+            "languages, even loosely worded or misspelled), always prefer "
+            "the mapped item(s) over your own independent guess. The "
+            "mapped value uses a simple wildcard convention with '*':\n"
+            "- No '*' at all (e.g. 'S72M200'): names one specific "
+            "master-list row directly - use it as the match, High "
+            "confidence.\n"
+            "- Trailing '*' (e.g. 'A9F791*'): a PRODUCT FAMILY of every "
+            "row whose code STARTS WITH that text.\n"
+            "- Leading '*' (e.g. '*25'): a PRODUCT FAMILY of every row "
+            "whose code ENDS WITH that text.\n"
+            "- '*' on both ends (e.g. '*25*'): a PRODUCT FAMILY of every "
+            "row whose code CONTAINS that text anywhere.\n"
+            "For any family match, pick whichever specific row in that "
+            "family best fits any further details in the extracted item "
+            "(size, pole count, amperage, rating, etc.); if the request "
+            "gives no way to narrow it down further, pick the most "
+            "plausible single row from the family and explain the choice "
+            "briefly in the notes field.\n\n"
+            f"{aliases_csv}"
+        )
+
+    conversion_section = (
+        "\n\nUNIT CONVERSION: requests sometimes state a motor/device's "
+        "power (kW or HP) while the catalog codes by rated current (A), or "
+        "the other way around. You may bridge this using standard "
+        "electrical engineering knowledge (the usual three-phase formula "
+        "I = P / (sqrt(3) x V x power factor x efficiency), typical "
+        "assumed power factor/efficiency for induction motors, and common "
+        "manufacturer AC-3 motor-starter selection tables for this kind of "
+        "equipment) rather than only literal text matching."
+    )
+    if assumptions.strip():
+        conversion_section += (
+            "\n\nBUSINESS ASSUMPTIONS (use these defaults unless the "
+            f"request clearly states otherwise):\n{assumptions.strip()}"
+        )
+    else:
+        conversion_section += (
+            " If the request doesn't state voltage/phase and no business "
+            "default is given, state the assumption you used in the notes "
+            "field so it can be double-checked."
+        )
 
     system_prompt = (
         "You are an expert equipment-catalog clerk. You read equipment "
@@ -312,7 +428,9 @@ def call_llm_for_matching(client, guest_parts, master_csv: str):
         "knowledge of electrical/industrial equipment to judge whether a "
         "loosely worded description plausibly refers to a specific "
         "catalog row. If no row is a reasonable match, say so rather than "
-        "guessing.\n\n"
+        "guessing."
+        f"{aliases_section}"
+        f"{conversion_section}\n\n"
         "Respond with a JSON array. Each array element must look like "
         "this:\n"
         "{\n"
@@ -434,6 +552,56 @@ with tab_admin:
         if current_master is not None:
             st.write(f"Current master list ({len(current_master)} rows) preview:")
             st.dataframe(current_master.head(20))
+
+        st.divider()
+        st.subheader("Optional - Custom Term Dictionary")
+        st.caption(
+            "Teach the app specific words or phrases that should always "
+            "point to a particular item, in any supported language. Prepare "
+            "a simple Excel file with two columns: the term/phrase in the "
+            "first column, and the matching value from your master list in "
+            "the second column - an exact code (e.g. 'S72M200') for one "
+            "specific item, or use '*' as a wildcard for a whole family of "
+            "items: 'A9F791*' = codes starting with that, '*25' = codes "
+            "ending with that, '*25*' = codes containing that anywhere. "
+            "The AI then picks the best specific item within a family "
+            "using the rest of the request's details. These mappings are "
+            "trusted as ground truth and override the AI's own guess."
+        )
+        aliases_upload = st.file_uploader(
+            "Upload term dictionary (.xls or .xlsx)",
+            type=["xls", "xlsx"],
+            key="aliases_uploader",
+        )
+        if aliases_upload is not None:
+            save_aliases_file(aliases_upload)
+            st.success("Term dictionary saved.")
+
+        current_aliases = load_aliases_df()
+        if current_aliases is not None:
+            st.write(
+                f"Current term dictionary ({len(current_aliases)} entries) "
+                "preview:"
+            )
+            st.dataframe(current_aliases.head(20))
+
+        st.divider()
+        st.subheader("Optional - Business Assumptions")
+        st.caption(
+            "Free text the AI uses as default context for every request - "
+            "most useful for electrical unit conversions (kW <-> A), e.g. "
+            "'Assume 380V three-phase supply unless the request states "
+            "otherwise.' Leave blank to let the AI state its own assumption "
+            "per request in the notes column instead."
+        )
+        assumptions_input = st.text_area(
+            "Business assumptions",
+            value=load_assumptions(),
+            height=100,
+        )
+        if st.button("Save assumptions"):
+            save_assumptions(assumptions_input)
+            st.success("Assumptions saved.")
     elif admin_password_input:
         st.error("Incorrect password.")
 
@@ -477,8 +645,13 @@ with tab_guest:
                                 f"{MAX_MASTER_ROWS_SENT_TO_LLM} were used "
                                 "for matching."
                             )
+                        aliases_csv = build_aliases_context(load_aliases_df())
                         results = call_llm_for_matching(
-                            client, guest_parts, master_csv
+                            client,
+                            guest_parts,
+                            master_csv,
+                            aliases_csv,
+                            load_assumptions(),
                         )
                         result_df = results_to_dataframe(results)
 
