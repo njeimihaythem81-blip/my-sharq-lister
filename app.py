@@ -378,6 +378,33 @@ def save_assumptions(text: str):
 # Reading the guest's file into a format Gemini can understand
 # --------------------------------------------------------------------------
 
+def decode_text_bytes(data: bytes) -> str:
+    """
+    Decode raw bytes from an uploaded .txt file into a string, trying the
+    encodings real-world guest uploads actually use. Arabic .txt files
+    saved by older/Windows software are very often Windows-1256, NOT
+    UTF-8. Blindly decoding as UTF-8 with errors="ignore" silently
+    deletes every Arabic byte and leaves only the numbers/Latin text
+    behind - which looks exactly like "it only reads numbers and ignores
+    the words". This tries the encodings most likely to be correct, in
+    order, before ever falling back to a lossy decode.
+    """
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+
+    for encoding in ("windows-1256", "cp1252"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    # Last resort only: never crash, salvage whatever is valid UTF-8.
+    return data.decode("utf-8", errors="ignore")
+
+
 def read_guest_file_as_parts(uploaded_file):
     """
     Turn the guest's uploaded file into a list of Gemini API "Part" objects.
@@ -425,7 +452,7 @@ def read_guest_file_as_parts(uploaded_file):
         return [types.Part.from_text(text=text)], None
 
     elif name.endswith(".txt"):
-        text = data.decode("utf-8", errors="ignore")
+        text = decode_text_bytes(data)
         if not text.strip():
             return None, "That text file appears to be empty."
         return [types.Part.from_text(text=text)], None
