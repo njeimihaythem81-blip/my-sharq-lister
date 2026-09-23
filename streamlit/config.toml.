@@ -1,12 +1,13 @@
 [theme]
-# Pistachio green accent (buttons, active tab, sliders, checkboxes)
-primaryColor = "#8FBC6F"
-# Clear, light grey page background
-backgroundColor = "#F2F2EF"
-# Slightly deeper grey for input boxes / sidebar panels
-secondaryBackgroundColor = "#E3E3DE"
-# Black text throughout
-textColor = "#111111"
+# Bright green accent (buttons, active tab, sliders, checkboxes, upload box)
+primaryColor = "#00D26E"
+# Chrome-grey page background (the .stApp CSS gradient in app.py adds the
+# metallic shine on top of this flat fallback)
+backgroundColor = "#C7C9CE"
+# White panels / input boxes / sidebar
+secondaryBackgroundColor = "#FFFFFF"
+# Royal blue text throughout
+textColor = "#1B2FBE"
 font = "sans serif"
 
 [server]
