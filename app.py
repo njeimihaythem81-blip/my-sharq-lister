@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -39,6 +40,8 @@ MASTER_DIR = "master_data"
 MASTER_FILE_PATH = os.path.join(MASTER_DIR, "master_list.xlsx")
 ALIASES_FILE_PATH = os.path.join(MASTER_DIR, "aliases.xlsx")
 ASSUMPTIONS_FILE_PATH = os.path.join(MASTER_DIR, "assumptions.txt")
+EMPLOYEES_FILE_PATH = os.path.join(MASTER_DIR, "employees.json")
+MAX_EMPLOYEES = 5  # internal tool for the company's own staff, not the public
 MODEL_NAME = "gemini-3.5-flash-lite"  # gemini-2.5-flash-lite was retired for new users
 MAX_FILE_SIZE_MB = 20  # Gemini's own inline-file limit
 
@@ -417,6 +420,80 @@ def save_assumptions(text: str):
 
 
 # --------------------------------------------------------------------------
+# Employee logins (internal tool - the admin manually creates up to
+# MAX_EMPLOYEES accounts, each with a 4-digit code; there is no public
+# self-signup). Stored as a small local JSON file, same pattern as the
+# other admin-managed settings on disk.
+# --------------------------------------------------------------------------
+
+import json as _json  # local alias avoids shadowing the top-level json import
+import random
+
+
+def load_employees() -> list:
+    """Return the list of employee accounts: [{"name": ..., "code": ...}]."""
+    if os.path.exists(EMPLOYEES_FILE_PATH):
+        try:
+            with open(EMPLOYEES_FILE_PATH, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+
+def save_employees(employees: list):
+    """Persist the employee account list to disk."""
+    with open(EMPLOYEES_FILE_PATH, "w", encoding="utf-8") as f:
+        _json.dump(employees, f, ensure_ascii=False, indent=2)
+
+
+def generate_unique_code(existing_employees: list) -> str:
+    """Generate a random 4-digit code not already used by another employee."""
+    used_codes = {e["code"] for e in existing_employees}
+    while True:
+        code = f"{random.randint(0, 9999):04d}"
+        if code not in used_codes:
+            return code
+
+
+def add_employee(name: str) -> str:
+    """
+    Add a new employee with an auto-generated 4-digit code and persist it.
+    Returns the generated code. Raises ValueError if the name is blank,
+    already exists, or MAX_EMPLOYEES would be exceeded.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError("Employee name cannot be blank.")
+    employees = load_employees()
+    if len(employees) >= MAX_EMPLOYEES:
+        raise ValueError(f"Maximum of {MAX_EMPLOYEES} employees already reached.")
+    if any(e["name"].strip().lower() == name.lower() for e in employees):
+        raise ValueError(f'An employee named "{name}" already exists.')
+    code = generate_unique_code(employees)
+    employees.append({"name": name, "code": code})
+    save_employees(employees)
+    return code
+
+
+def remove_employee(name: str):
+    """Remove an employee account by name and persist the change."""
+    employees = load_employees()
+    employees = [e for e in employees if e["name"] != name]
+    save_employees(employees)
+
+
+def check_employee_login(name: str, code: str):
+    """Return the employee dict if name+code match a stored account, else None."""
+    for e in load_employees():
+        if e["name"] == name and str(e["code"]) == str(code).strip():
+            return e
+    return None
+
+
+# --------------------------------------------------------------------------
 # Reading the guest's file into a format Gemini can understand
 # --------------------------------------------------------------------------
 
@@ -504,6 +581,60 @@ def read_guest_file_as_parts(uploaded_file):
 
 
 # --------------------------------------------------------------------------
+# Transient-error retry. Gemini's free tier returns 503 UNAVAILABLE
+# ("model is currently experiencing high demand") or 429 RESOURCE_EXHAUSTED
+# (rate limit) fairly often at busy times - both are almost always
+# temporary. Retrying a few times with increasing delay clears most of
+# these automatically instead of failing the whole request on the first
+# hit.
+# --------------------------------------------------------------------------
+
+GEMINI_MAX_RETRIES = 4
+GEMINI_RETRY_BASE_DELAY_SECONDS = 2  # waits 2s, 4s, 8s between attempts
+
+
+def _is_transient_gemini_error(msg: str) -> bool:
+    msg_lower = msg.lower()
+    return (
+        "503" in msg
+        or "unavailable" in msg_lower
+        or "overloaded" in msg_lower
+        or "429" in msg
+        or "resource_exhausted" in msg_lower
+        or "deadline" in msg_lower
+        or "timeout" in msg_lower
+    )
+
+
+def generate_content_with_retry(client, status_placeholder=None, **kwargs):
+    """
+    Wraps client.models.generate_content with automatic retries on
+    transient errors (server overloaded, rate limited, timed out), with
+    increasing delay between attempts. Non-transient errors (bad request,
+    safety block, etc.) are raised immediately without retrying. Raises
+    the last error if every attempt fails.
+    """
+    last_error = None
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            return client.models.generate_content(**kwargs)
+        except Exception as e:
+            last_error = e
+            is_last_attempt = attempt == GEMINI_MAX_RETRIES
+            if not _is_transient_gemini_error(str(e)) or is_last_attempt:
+                raise
+            delay = GEMINI_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            if status_placeholder is not None:
+                render_blinking_status(
+                    status_placeholder,
+                    "AI service is busy, retrying "
+                    f"({attempt}/{GEMINI_MAX_RETRIES - 1})...",
+                )
+            time.sleep(delay)
+    raise last_error  # pragma: no cover - loop always returns or raises
+
+
+# --------------------------------------------------------------------------
 # Talking to the LLM: extraction AND matching done together, with real
 # semantic understanding, against the full master list
 # --------------------------------------------------------------------------
@@ -520,6 +651,84 @@ def build_master_context(master_df: pd.DataFrame) -> tuple[str, bool]:
     return trimmed.to_csv(index=False), was_truncated
 
 
+def filter_candidate_rows(
+    master_df: pd.DataFrame,
+    extracted_items,
+    min_candidates: int = 150,
+    max_candidates: int = 1200,
+) -> pd.DataFrame:
+    """
+    Narrow the master list down to the rows most likely relevant to THIS
+    request's items, before it's sent to the AI matching step - a plain
+    local word-overlap search, no AI call, effectively instant even for
+    thousands of rows. This shrinks the prompt sent to the AI matching
+    step, which reduces both latency and how much of the free quota each
+    request uses.
+
+    Safety margin against hallucination: if the local search can't find
+    enough overlapping rows (min_candidates), that means the request's
+    wording doesn't cleanly match the catalog text - exactly the case
+    where a narrow candidate list risks silently excluding the true
+    correct answer. In that situation this falls back to returning the
+    FULL master list unfiltered, so the AI matching step always sees
+    every possible candidate whenever the local search isn't confident.
+    """
+    if master_df is None or master_df.empty or len(master_df) <= min_candidates:
+        return master_df
+
+    word_re = re.compile(r"[A-Za-z\u0600-\u06FF0-9]{2,}")
+
+    # Pre-tokenize every master row once (its full text, all columns).
+    row_texts = master_df.fillna("").astype(str).agg(" ".join, axis=1)
+    row_tokens = row_texts.str.lower().apply(lambda t: set(word_re.findall(t)))
+
+    item_texts = [str(it.get("extracted_text", "")) for it in extracted_items]
+    item_token_sets = [
+        set(word_re.findall(t.lower())) for t in item_texts if t.strip()
+    ]
+    if not item_token_sets:
+        return master_df
+
+    scores = pd.Series(0, index=master_df.index)
+    for item_tokens in item_token_sets:
+        if not item_tokens:
+            continue
+        overlap = row_tokens.apply(lambda rt: len(rt & item_tokens))
+        scores = scores.combine(overlap, max)
+
+    matched = scores[scores > 0].sort_values(ascending=False)
+    if len(matched) < min_candidates:
+        # Local search too weak to be trusted - use the full list instead
+        # of risking a narrow, possibly-wrong candidate set.
+        return master_df
+
+    top_index = matched.head(max_candidates).index
+    return master_df.loc[top_index]
+
+
+def suggest_top_candidates(master_df: pd.DataFrame, extracted_text: str, top_n: int = 5):
+    """
+    Return up to top_n master-list rows (as dicts) most textually similar
+    to a single item's extracted text - used to build suggestion buttons
+    for the human review step. Same lightweight word-overlap approach as
+    filter_candidate_rows, just scoped to one item and always against the
+    FULL master list (never the narrowed AI-matching candidate set),
+    since a human reviewer should see the best possible suggestions.
+    """
+    if master_df is None or master_df.empty or not str(extracted_text).strip():
+        return []
+    word_re = re.compile(r"[A-Za-z\u0600-\u06FF0-9]{2,}")
+    item_tokens = set(word_re.findall(str(extracted_text).lower()))
+    if not item_tokens:
+        return []
+    row_texts = master_df.fillna("").astype(str).agg(" ".join, axis=1)
+    scores = row_texts.str.lower().apply(
+        lambda t: len(set(word_re.findall(t)) & item_tokens)
+    )
+    matched = scores[scores > 0].sort_values(ascending=False).head(top_n)
+    return [master_df.loc[idx].to_dict() for idx in matched.index]
+
+
 def build_aliases_context(aliases_df):
     """
     Turn the optional custom term dictionary into CSV text, or None if no
@@ -532,21 +741,95 @@ def build_aliases_context(aliases_df):
     return aliases_df.to_csv(index=False)
 
 
-def extract_items_from_file(client, guest_parts):
+def build_common_vocabulary(master_df, aliases_df, top_n: int = 100) -> str:
+    """
+    Derive the most frequent words appearing in the master list and term
+    dictionary, to prime the handwriting-reading step with the business's
+    real vocabulary (contactor, breaker family names, local trade terms,
+    etc.) so ambiguous handwriting strokes get read toward a plausible
+    known word instead of guessed letter-by-letter. Fully automatic - no
+    file to maintain by hand; it updates itself whenever the master list
+    or term dictionary is updated from the Admin tab.
+    """
+    from collections import Counter
+
+    word_re = re.compile(r"[A-Za-z\u0600-\u06FF]{2,}")
+    counts = Counter()
+
+    if master_df is not None and not master_df.empty:
+        # Prefer a column that looks like an item-name/description column;
+        # fall back to every string column if none is obviously named that.
+        name_cols = [
+            c
+            for c in master_df.columns
+            if any(k in str(c).lower() for k in ("name", "desc", "اسم", "صنف"))
+        ]
+        cols_to_scan = name_cols or list(master_df.columns)
+        for col in cols_to_scan:
+            for val in master_df[col].dropna().astype(str):
+                counts.update(w.lower() for w in word_re.findall(val))
+
+    if aliases_df is not None and not aliases_df.empty:
+        term_col = aliases_df.columns[0]
+        for val in aliases_df[term_col].dropna().astype(str):
+            counts.update(w.lower() for w in word_re.findall(val))
+
+    common = [w for w, _ in counts.most_common(top_n)]
+    return ", ".join(common)
+
+
+def extract_items_from_file(
+    client, guest_parts, vocabulary_hint: str = "", status_placeholder=None
+):
     """
     Ask Gemini to read the guest's file and extract every distinct piece
     of equipment mentioned, with its quantity if given. This step never
     sees the master list or term dictionary at all - those are applied
-    afterward by resolve_items() - so extraction stays fast and focused.
-    Raises a plain Exception with a human-readable message on failure.
+    afterward by resolve_items() - so extraction stays fast and focused
+    (vocabulary_hint is just a short list of common WORDS, not the master
+    list itself, used only to help read messy handwriting).
+
+    Internally this is done in two stages inside a single model call (so
+    it costs no extra latency or API quota): first a verbatim, whole-page
+    transcription, then structured extraction from that transcription.
+    Doing the raw reading first measurably reduces misreads, because the
+    model isn't forced to commit to structured output while it's still
+    deciphering the handwriting, and it can use context from anywhere on
+    the page (margin notes, repeated words elsewhere) to resolve a
+    doubtful word - not just the single line it appears on.
+
+    Returns (items, raw_reading). Raises a plain Exception with a
+    human-readable message on failure.
     """
     from google.genai import types
+
+    vocabulary_section = ""
+    if vocabulary_hint:
+        vocabulary_section = (
+            "\n\nCOMMON VOCABULARY in this business's orders (use this to "
+            "help read doubtful handwriting toward a plausible known word "
+            "- but never force a reading that clearly doesn't match what's "
+            f"actually on the page):\n{vocabulary_hint}\n"
+        )
 
     system_prompt = (
         "You read equipment requests that may be handwritten, scanned, "
         "typed, or contained in a document, written in Arabic, English, or "
-        "French. Extract every distinct piece of equipment mentioned, "
-        "together with its requested quantity if one is given.\n\n"
+        "French.\n\n"
+        "Work in two stages, in this order:\n\n"
+        "STAGE 1 - RAW READING: First, transcribe EVERYTHING visible on "
+        "the page as literally and completely as you can, line by line, "
+        "in reading order, exactly as written (keep it in its original "
+        "language/script, don't translate or interpret yet). Treat the "
+        "whole page as one connected context: if a word is unclear on one "
+        "line but the same or a related word appears more clearly "
+        "elsewhere on the page (a margin note, a heading, a repeated "
+        "item), use that to resolve the doubtful reading."
+        f"{vocabulary_section}\n\n"
+        "STAGE 2 - STRUCTURED EXTRACTION: Using ONLY your stage-1 "
+        "transcription, extract every distinct piece of equipment "
+        "mentioned, together with its requested quantity if one is "
+        "given.\n\n"
         "IMPORTANT - quantity vs. spec numbers: Arabic order lists mix "
         "right-to-left Arabic text with numerals and abbreviations that "
         "render left-to-right, and a single line very often contains MORE "
@@ -564,25 +847,34 @@ def extract_items_from_file(client, guest_parts):
         "number by itself with no item description - if that's about to "
         "happen, re-read the line: the description was likely misread as "
         "the quantity or dropped entirely.\n\n"
-        "Respond with a JSON array. Each array element must look like "
-        "this:\n"
+        "Respond with a single JSON object with exactly two fields:\n"
         "{\n"
-        '  "extracted_text": "the item exactly as it appeared in the '
+        '  "raw_reading": "your full stage-1 verbatim transcription, as '
+        'one text block with line breaks",\n'
+        '  "items": [\n'
+        "    {\n"
+        '      "extracted_text": "the item exactly as it appeared in the '
         'request (its code, name, or full description)",\n'
-        '  "detected_language": "Arabic" | "English" | "French" | "Other",\n'
-        '  "quantity": "quantity found, or empty string if none was given"\n'
+        '      "detected_language": "Arabic" | "English" | "French" | '
+        '"Other",\n'
+        '      "quantity": "quantity found, or empty string if none was '
+        'given"\n'
+        "    }\n"
+        "  ]\n"
         "}"
     )
 
     contents = list(guest_parts)
     contents.append(
         types.Part.from_text(
-            text="Extract the equipment items from this file exactly as instructed."
+            text="Read and extract the equipment items from this file exactly as instructed."
         )
     )
 
     try:
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client,
+            status_placeholder=status_placeholder,
             model=MODEL_NAME,
             contents=contents,
             config=types.GenerateContentConfig(
@@ -598,6 +890,13 @@ def extract_items_from_file(client, guest_parts):
                 "minute (or try again tomorrow if the daily limit was hit) "
                 "and try again."
             ) from e
+        if _is_transient_gemini_error(msg):
+            raise RuntimeError(
+                "The AI service is currently overloaded with requests "
+                "from many users and didn't recover even after several "
+                "retries. This is temporary on Google's side - please "
+                "wait a minute and try again."
+            ) from e
         raise RuntimeError(f"The AI service returned an error: {msg}") from e
 
     raw_text = getattr(response, "text", None)
@@ -609,12 +908,26 @@ def extract_items_from_file(client, guest_parts):
         )
 
     parsed = json.loads(raw_text)
-    if not isinstance(parsed, list):
+    # Accept both the new {"raw_reading":..., "items":[...]} shape and,
+    # defensively, a bare list (in case the model ever reverts to the old
+    # shape), so this never hard-breaks on a minor format slip.
+    if isinstance(parsed, dict) and "items" in parsed:
+        items = parsed["items"]
+        raw_reading = parsed.get("raw_reading", "")
+    elif isinstance(parsed, list):
+        items = parsed
+        raw_reading = ""
+    else:
+        raise RuntimeError(
+            "The AI's response wasn't in the expected format. Please try "
+            "again."
+        )
+    if not isinstance(items, list):
         raise RuntimeError(
             "The AI's response wasn't in the expected list format. "
             "Please try again."
         )
-    return parsed
+    return items, raw_reading
 
 
 # --------------------------------------------------------------------------
@@ -720,7 +1033,12 @@ def _dedupe_hits_by_specificity(hits):
 # --------------------------------------------------------------------------
 
 def call_llm_for_item_matching(
-    client, items_for_ai, master_csv: str, aliases_csv=None, assumptions: str = ""
+    client,
+    items_for_ai,
+    master_csv: str,
+    aliases_csv=None,
+    assumptions: str = "",
+    status_placeholder=None,
 ):
     """
     Match a list of already-extracted items against the master list using
@@ -800,7 +1118,9 @@ def call_llm_for_item_matching(
     )
 
     try:
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client,
+            status_placeholder=status_placeholder,
             model=MODEL_NAME,
             contents=[
                 types.Part.from_text(
@@ -819,6 +1139,13 @@ def call_llm_for_item_matching(
                 "The free Gemini usage limit was reached. Please wait a "
                 "minute (or try again tomorrow if the daily limit was hit) "
                 "and try again."
+            ) from e
+        if _is_transient_gemini_error(msg):
+            raise RuntimeError(
+                "The AI service is currently overloaded with requests "
+                "from many users and didn't recover even after several "
+                "retries. This is temporary on Google's side - please "
+                "wait a minute and try again."
             ) from e
         raise RuntimeError(f"The AI service returned an error: {msg}") from e
 
@@ -890,7 +1217,15 @@ def _compute_component_quantity(requested_quantity, multiplier):
     return str(total)
 
 
-def resolve_items(client, extracted_items, master_df, aliases_df, master_csv, assumptions):
+def resolve_items(
+    client,
+    extracted_items,
+    master_df,
+    aliases_df,
+    master_csv,
+    assumptions,
+    status_placeholder=None,
+):
     """
     Combine deterministic term-dictionary resolution (guaranteed, no AI
     needed) with AI-based matching for whatever the dictionary doesn't
@@ -1025,7 +1360,12 @@ def resolve_items(client, extracted_items, master_df, aliases_df, master_csv, as
                 payload = {k: v for k, v in payload.items() if k != "hint"}
             items_payload.append(payload)
         ai_results = call_llm_for_item_matching(
-            client, items_payload, master_csv, build_aliases_context(aliases_df), assumptions
+            client,
+            items_payload,
+            master_csv,
+            build_aliases_context(aliases_df),
+            assumptions,
+            status_placeholder=status_placeholder,
         )
         if len(ai_results) != len(ai_entries):
             raise RuntimeError(
@@ -1039,8 +1379,18 @@ def resolve_items(client, extracted_items, master_df, aliases_df, master_csv, as
 
 
 # --------------------------------------------------------------------------
-# Turning the LLM's answer into a downloadable Excel file
+# Human-in-the-loop review: any Low-confidence or no-match item is shown
+# to the employee (immediately, before the Excel download unlocks) with
+# suggested candidates plus a free-text field for their own correction.
+# Reviewed manually every time - nothing is auto-saved back into the term
+# dictionary.
 # --------------------------------------------------------------------------
+
+def needs_review(result: dict) -> bool:
+    """An item needs human review if confidence is Low, or nothing matched."""
+    confidence = str(result.get("confidence", "")).strip().lower()
+    return confidence == "low" or not result.get("matched_master_row")
+
 
 def results_to_dataframe(results) -> pd.DataFrame:
     rows = []
@@ -1074,7 +1424,7 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
 # --------------------------------------------------------------------------
 
 tab_guest, tab_admin = st.tabs(
-    ["Guest: Submit a Request", "Admin: Manage Master List"]
+    ["Employee: Submit a Request", "Admin: Manage Master List"]
 )
 
 # ---- Admin tab -------------------------------------------------------
@@ -1156,12 +1506,112 @@ with tab_admin:
         if st.button("Save assumptions"):
             save_assumptions(assumptions_input)
             st.success("Assumptions saved.")
+
+        st.divider()
+        st.subheader("Employee Logins")
+        st.caption(
+            f"This tool is for internal staff only (max {MAX_EMPLOYEES} "
+            "accounts). Add each employee's name below to generate their "
+            "4-digit login code, then share that code with them directly - "
+            "there is no self-signup."
+        )
+        current_employees = load_employees()
+        if current_employees:
+            st.dataframe(
+                pd.DataFrame(current_employees).rename(
+                    columns={"name": "Name", "code": "4-digit code"}
+                ),
+                hide_index=True,
+            )
+        else:
+            st.caption("No employees added yet.")
+
+        if len(current_employees) >= MAX_EMPLOYEES:
+            st.warning(
+                f"Maximum of {MAX_EMPLOYEES} employees reached. Remove one "
+                "below before adding another."
+            )
+        else:
+            with st.form("add_employee_form", clear_on_submit=True):
+                new_employee_name = st.text_input("New employee name")
+                add_submitted = st.form_submit_button("Add employee")
+            if add_submitted:
+                try:
+                    generated_code = add_employee(new_employee_name)
+                    st.success(
+                        f'Employee "{new_employee_name.strip()}" added. '
+                        f"Their login code is: **{generated_code}** "
+                        "(share it with them now - it won't be shown "
+                        "again here except in the table above)."
+                    )
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+        if current_employees:
+            employee_to_remove = st.selectbox(
+                "Remove an employee",
+                options=[e["name"] for e in current_employees],
+                key="remove_employee_select",
+            )
+            if st.button("Remove selected employee"):
+                remove_employee(employee_to_remove)
+                st.success(f'Employee "{employee_to_remove}" removed.')
+                st.rerun()
     elif admin_password_input:
         st.error("Incorrect password.")
 
-# ---- Guest tab --------------------------------------------------------
+# ---- Employee tab -------------------------------------------------------
 with tab_guest:
-    st.subheader("Guest - Upload Your Request")
+    st.subheader("Employee - Upload Your Request")
+
+    # ---- Login gate: this tool is for internal staff only. Each employee
+    # logs in with their name + 4-digit code (issued by the admin) before
+    # they can submit anything. Session-scoped, so their in-progress
+    # request/review is theirs alone - nothing is shared between staff.
+    if "current_employee" not in st.session_state:
+        st.session_state["current_employee"] = None
+
+    if st.session_state["current_employee"] is None:
+        employees = load_employees()
+        if not employees:
+            st.warning(
+                "No employee accounts exist yet. Please ask the "
+                "administrator to add one first (Admin tab)."
+            )
+        else:
+            st.info("Please log in with your name and 4-digit code.")
+            login_name = st.selectbox(
+                "Your name", options=[e["name"] for e in employees]
+            )
+            login_code = st.text_input(
+                "4-digit code", max_chars=4, type="password"
+            )
+            if st.button("Log in"):
+                matched_employee = check_employee_login(login_name, login_code)
+                if matched_employee:
+                    st.session_state["current_employee"] = login_name
+                    st.rerun()
+                else:
+                    st.error("Incorrect code. Please try again.")
+        st.stop()
+
+    col_who, col_logout = st.columns([4, 1])
+    with col_who:
+        st.caption(f"Logged in as: **{st.session_state['current_employee']}**")
+    with col_logout:
+        if st.button("Log out"):
+            for key in (
+                "current_employee",
+                "req_run_id",
+                "req_results",
+                "req_review_indices",
+                "req_review_done",
+                "req_raw_reading",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
+
     master_df = load_master_df()
 
     if master_df is None:
@@ -1181,6 +1631,11 @@ with tab_guest:
         )
 
         if guest_upload is not None and st.button("Process Request"):
+            # Starting a fresh request always clears any previous
+            # run's results/review state for this employee.
+            for key in ("req_results", "req_review_indices", "req_raw_reading"):
+                st.session_state.pop(key, None)
+
             status_placeholder = st.empty()
             try:
                 render_blinking_status(status_placeholder, "Loading file...")
@@ -1190,7 +1645,25 @@ with tab_guest:
                     st.error(file_error)
                 else:
                     client = get_gemini_client()
-                    master_csv, was_truncated = build_master_context(master_df)
+                    aliases_df = load_aliases_df()
+                    vocabulary_hint = build_common_vocabulary(master_df, aliases_df)
+
+                    render_blinking_status(
+                        status_placeholder, "Identification in process..."
+                    )
+                    extracted_items, raw_reading = extract_items_from_file(
+                        client,
+                        guest_parts,
+                        vocabulary_hint=vocabulary_hint,
+                        status_placeholder=status_placeholder,
+                    )
+
+                    # Narrow the master list to this request's likely
+                    # candidates before the (slower, larger) AI matching
+                    # call - falls back to the full list on its own
+                    # whenever the local search isn't confident.
+                    candidate_df = filter_candidate_rows(master_df, extracted_items)
+                    master_csv, was_truncated = build_master_context(candidate_df)
                     if was_truncated:
                         st.warning(
                             f"The master list has more than "
@@ -1199,12 +1672,7 @@ with tab_guest:
                             f"{MAX_MASTER_ROWS_SENT_TO_LLM} were used "
                             "for matching."
                         )
-                    aliases_df = load_aliases_df()
 
-                    render_blinking_status(
-                        status_placeholder, "Identification in process..."
-                    )
-                    extracted_items = extract_items_from_file(client, guest_parts)
                     results = resolve_items(
                         client,
                         extracted_items,
@@ -1212,32 +1680,15 @@ with tab_guest:
                         aliases_df,
                         master_csv,
                         load_assumptions(),
+                        status_placeholder=status_placeholder,
                     )
                     status_placeholder.empty()
 
-                    result_df = results_to_dataframe(results)
-
-                    st.success(f"Found {len(result_df)} item(s).")
-                    st.dataframe(result_df)
-
-                    excel_bytes = df_to_excel_bytes(result_df)
-                    excel_filename = (
-                        "matched_equipment_"
-                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                    )
-                    col_download, col_whatsapp = st.columns(2)
-                    with col_download:
-                        st.download_button(
-                            "Download Results as Excel",
-                            data=excel_bytes,
-                            file_name=excel_filename,
-                            mime=(
-                                "application/vnd.openxmlformats-"
-                                "officedocument.spreadsheetml.sheet"
-                            ),
-                        )
-                    with col_whatsapp:
-                        render_whatsapp_share_button(excel_bytes, excel_filename)
+                    st.session_state["req_results"] = results
+                    st.session_state["req_review_indices"] = [
+                        i for i, r in enumerate(results) if needs_review(r)
+                    ]
+                    st.session_state["req_raw_reading"] = raw_reading
             except json.JSONDecodeError:
                 status_placeholder.empty()
                 st.error(
@@ -1251,3 +1702,135 @@ with tab_guest:
             except Exception as e:
                 status_placeholder.empty()
                 st.error(f"Something went wrong: {e}")
+
+        # ---- Results / human review, rendered from session state so it
+        # survives the rerun triggered by the review form's own widgets
+        # (a rerun happens on every interaction, and "Process Request"
+        # itself won't be pressed again during review). Each employee's
+        # session only ever holds their own current request - nothing
+        # here is shared between employees.
+        if st.session_state.get("req_results") is not None:
+            results = st.session_state["req_results"]
+            review_indices = st.session_state.get("req_review_indices", [])
+
+            if review_indices:
+                st.warning(
+                    f"{len(review_indices)} item(s) need your review "
+                    "before the results can be downloaded - the AI "
+                    "wasn't confident about them."
+                )
+                with st.form("review_form"):
+                    choices = {}
+                    manual_texts = {}
+                    candidates_by_index = {}
+                    for idx in review_indices:
+                        r = results[idx]
+                        st.markdown(
+                            f"**{r.get('extracted_text', '(no text)')}** "
+                            f"&nbsp;·&nbsp; qty: {r.get('quantity', '')}"
+                        )
+                        if r.get("notes"):
+                            st.caption(r["notes"])
+                        candidates = suggest_top_candidates(
+                            master_df, r.get("extracted_text", ""), top_n=5
+                        )
+                        candidates_by_index[idx] = candidates
+
+                        def _format_option(opt_i, _candidates=candidates):
+                            if opt_i == 0:
+                                return "Keep the AI's current result as-is"
+                            if opt_i == len(_candidates) + 1:
+                                return "None of these - write it in myself"
+                            row = _candidates[opt_i - 1]
+                            values = [str(v) for v in row.values() if str(v).strip()]
+                            return " — ".join(values[:3])
+
+                        num_options = len(candidates) + 2
+                        chosen = st.radio(
+                            "Choose the correct match",
+                            options=list(range(num_options)),
+                            format_func=_format_option,
+                            key=f"review_choice_{idx}",
+                        )
+                        choices[idx] = chosen
+                        if chosen == len(candidates) + 1:
+                            manual_texts[idx] = st.text_input(
+                                "Your correction (item name/code, or leave "
+                                "blank to mark as no match)",
+                                key=f"review_manual_{idx}",
+                            )
+                        st.divider()
+
+                    review_submitted = st.form_submit_button("Confirm & Continue")
+
+                if review_submitted:
+                    for idx in review_indices:
+                        chosen = choices[idx]
+                        candidates = candidates_by_index[idx]
+                        if chosen == 0:
+                            # Keep the AI's result, but make clear a human
+                            # looked at it and chose to keep it as-is.
+                            results[idx]["notes"] = (
+                                results[idx].get("notes", "")
+                                + " [Employee reviewed: kept as-is.]"
+                            ).strip()
+                        elif chosen == len(candidates) + 1:
+                            manual_text = manual_texts.get(idx, "").strip()
+                            results[idx]["matched_master_row"] = None
+                            results[idx]["confidence"] = "Manual"
+                            results[idx]["notes"] = (
+                                f"Employee manual correction: {manual_text}"
+                                if manual_text
+                                else "Employee confirmed: no match in "
+                                "master list."
+                            )
+                        else:
+                            chosen_row = candidates[chosen - 1]
+                            results[idx]["matched_master_row"] = chosen_row
+                            results[idx]["confidence"] = "High"
+                            results[idx]["notes"] = (
+                                "Employee manually selected this match "
+                                "during review."
+                            )
+                    st.session_state["req_results"] = results
+                    st.session_state["req_review_indices"] = []
+                    st.rerun()
+
+            else:
+                result_df = results_to_dataframe(results)
+
+                st.success(f"Found {len(result_df)} item(s).")
+                st.dataframe(result_df)
+
+                raw_reading = st.session_state.get("req_raw_reading", "")
+                if raw_reading:
+                    with st.expander("📝 Raw text read from your file"):
+                        st.text(raw_reading)
+
+                excel_bytes = df_to_excel_bytes(result_df)
+                excel_filename = (
+                    "matched_equipment_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                )
+                col_download, col_whatsapp = st.columns(2)
+                with col_download:
+                    st.download_button(
+                        "Download Results as Excel",
+                        data=excel_bytes,
+                        file_name=excel_filename,
+                        mime=(
+                            "application/vnd.openxmlformats-"
+                            "officedocument.spreadsheetml.sheet"
+                        ),
+                    )
+                with col_whatsapp:
+                    render_whatsapp_share_button(excel_bytes, excel_filename)
+
+                if st.button("Start New Request"):
+                    for key in (
+                        "req_results",
+                        "req_review_indices",
+                        "req_raw_reading",
+                    ):
+                        st.session_state.pop(key, None)
+                    st.rerun()
