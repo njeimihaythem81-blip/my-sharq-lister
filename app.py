@@ -570,6 +570,41 @@ def read_guest_file_as_parts(uploaded_file):
             return None, "That Word document appears to be empty."
         return [types.Part.from_text(text=text)], None
 
+    elif name.endswith(".xls"):
+        # Legacy Excel (.xls, pre-2007 binary format). Read every sheet
+        # with xlrd (pure Python, no external program needed - reads the
+        # file's own codepage automatically, so Arabic cells come through
+        # correctly) and turn each non-empty row into one line of text,
+        # the same way a handwritten order list would read.
+        try:
+            import xlrd
+        except ImportError:
+            return None, (
+                "Reading .xls files requires the 'xlrd' package, which "
+                "isn't installed on this server. Please add xlrd to "
+                "requirements.txt and redeploy, or re-save the file as "
+                ".xlsx."
+            )
+        try:
+            book = xlrd.open_workbook(file_contents=data)
+        except Exception as e:
+            return None, f"Couldn't read that .xls file: {e}"
+
+        lines = []
+        for sheet in book.sheets():
+            for r in range(sheet.nrows):
+                cells = [
+                    str(sheet.cell_value(r, c)).strip()
+                    for c in range(sheet.ncols)
+                ]
+                cells = [c for c in cells if c and c.lower() != "none"]
+                if cells:
+                    lines.append("  ".join(cells))
+        text = "\n".join(lines)
+        if not text.strip():
+            return None, "That .xls file appears to be empty."
+        return [types.Part.from_text(text=text)], None
+
     elif name.endswith(".txt"):
         text = decode_text_bytes(data)
         if not text.strip():
@@ -1419,6 +1454,71 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def _pick_code_column(matched_row: dict):
+    """
+    Given a matched master-list row (as a dict), pick the value that is
+    the item's code/reference number - the column whose header contains
+    "code" or the Arabic "رقم", falling back to the first column (the
+    master list's own code column is conventionally first).
+    """
+    for key, value in matched_row.items():
+        key_lower = str(key).lower()
+        if "code" in key_lower or "رقم" in key_lower:
+            return value
+    return next(iter(matched_row.values()), "")
+
+
+def results_to_export_dataframe(results) -> pd.DataFrame:
+    """
+    Build the download-ready dataframe in the company's required output
+    format: exactly two columns, رقم الصنف (item code) and الكمية
+    (quantity) - matching their existing order-form template. If an item
+    has no master-list match (left unmatched after review), its own
+    extracted text is used in the code column instead of leaving the row
+    empty, so nothing requested is silently dropped from the export.
+    """
+    rows = []
+    for r in results:
+        matched = r.get("matched_master_row")
+        code = _pick_code_column(matched) if matched else r.get("extracted_text", "")
+        rows.append(
+            {
+                "رقم الصنف": code,
+                "الكمية": r.get("quantity", ""),
+            }
+        )
+    return pd.DataFrame(rows, columns=["رقم الصنف", "الكمية"])
+
+
+def export_df_to_xls_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Write the export dataframe as a legacy .xls (Excel 97-2003) file,
+    matching the company's existing template format exactly. Uses xlwt
+    (pure Python, no external program required) so this works on any
+    standard Streamlit deployment.
+    """
+    try:
+        import xlwt
+    except ImportError as e:
+        raise RuntimeError(
+            "Exporting as .xls requires the 'xlwt' package, which isn't "
+            "installed on this server. Please add xlwt to "
+            "requirements.txt and redeploy."
+        ) from e
+
+    workbook = xlwt.Workbook(encoding="utf-8")
+    sheet = workbook.add_sheet("Sheet1")
+    for col_i, col_name in enumerate(df.columns):
+        sheet.write(0, col_i, col_name)
+    for row_i, row in enumerate(df.itertuples(index=False), start=1):
+        for col_i, value in enumerate(row):
+            sheet.write(row_i, col_i, value)
+
+    buf = io.BytesIO()
+    workbook.save(buf)
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
@@ -1622,12 +1722,12 @@ with tab_guest:
     else:
         st.info(
             "Upload a photo of handwriting, a scanned or digital PDF, a Word "
-            "document, or a text file (up to 20MB). Arabic, English, and "
-            "French are all supported."
+            "document, an Excel (.xls) file, or a text file (up to 20MB). "
+            "Arabic, English, and French are all supported."
         )
         guest_upload = st.file_uploader(
             "Upload your file",
-            type=["png", "jpg", "jpeg", "webp", "gif", "pdf", "docx", "txt"],
+            type=["png", "jpg", "jpeg", "webp", "gif", "pdf", "docx", "xls", "txt"],
         )
 
         if guest_upload is not None and st.button("Process Request"):
@@ -1807,24 +1907,30 @@ with tab_guest:
                     with st.expander("📝 Raw text read from your file"):
                         st.text(raw_reading)
 
-                excel_bytes = df_to_excel_bytes(result_df)
-                excel_filename = (
-                    "matched_equipment_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                )
-                col_download, col_whatsapp = st.columns(2)
-                with col_download:
-                    st.download_button(
-                        "Download Results as Excel",
-                        data=excel_bytes,
-                        file_name=excel_filename,
-                        mime=(
-                            "application/vnd.openxmlformats-"
-                            "officedocument.spreadsheetml.sheet"
-                        ),
+                # The downloadable file follows the company's required
+                # output template exactly: two columns (رقم الصنف /
+                # الكمية), saved as legacy .xls - not the fuller preview
+                # table shown above, which is kept detailed on-screen for
+                # the employee's own review.
+                export_df = results_to_export_dataframe(results)
+                try:
+                    excel_bytes = export_df_to_xls_bytes(export_df)
+                    excel_filename = (
+                        "matched_equipment_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls"
                     )
-                with col_whatsapp:
-                    render_whatsapp_share_button(excel_bytes, excel_filename)
+                    col_download, col_whatsapp = st.columns(2)
+                    with col_download:
+                        st.download_button(
+                            "Download Results as Excel",
+                            data=excel_bytes,
+                            file_name=excel_filename,
+                            mime="application/vnd.ms-excel",
+                        )
+                    with col_whatsapp:
+                        render_whatsapp_share_button(excel_bytes, excel_filename)
+                except RuntimeError as e:
+                    st.error(str(e))
 
                 if st.button("Start New Request"):
                     for key in (
