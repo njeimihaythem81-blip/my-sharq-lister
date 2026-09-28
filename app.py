@@ -17,14 +17,18 @@ deployment instructions.
 """
 
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import time
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -41,6 +45,8 @@ MASTER_FILE_PATH = os.path.join(MASTER_DIR, "master_list.xlsx")
 ALIASES_FILE_PATH = os.path.join(MASTER_DIR, "aliases.xlsx")
 ASSUMPTIONS_FILE_PATH = os.path.join(MASTER_DIR, "assumptions.txt")
 EMPLOYEES_FILE_PATH = os.path.join(MASTER_DIR, "employees.json")
+LEARNED_FILE_PATH = os.path.join(MASTER_DIR, "learned_choices.json")
+MIN_PASSWORD_LENGTH = 4
 MAX_EMPLOYEES = 5  # internal tool for the company's own staff, not the public
 MODEL_NAME = "gemini-3.5-flash-lite"  # gemini-2.5-flash-lite was retired for new users
 MAX_FILE_SIZE_MB = 20  # Gemini's own inline-file limit
@@ -357,6 +363,115 @@ def get_gemini_client():
 
 
 # --------------------------------------------------------------------------
+# Persistent storage. Streamlit Community Cloud wipes the app's local disk
+# on every restart/redeploy, which is why employees used to "disappear".
+# Small settings files (employees, learned choices, assumptions) are
+# therefore ALSO backed up to a private GitHub Gist and restored from it
+# automatically whenever the local copy is missing. Setup: add GITHUB_TOKEN
+# (classic token with the "gist" scope) and GIST_ID to the app's Secrets.
+# Without them the app still works exactly as before (local disk only).
+# --------------------------------------------------------------------------
+
+GIST_API = "https://api.github.com/gists"
+
+
+class PersistenceError(Exception):
+    """Cloud storage could not be read or written."""
+
+
+def _gist_creds():
+    return get_secret("GITHUB_TOKEN"), get_secret("GIST_ID")
+
+
+def persistence_enabled() -> bool:
+    token, gist_id = _gist_creds()
+    return bool(token and gist_id)
+
+
+def _gist_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def _gist_get_file(filename):
+    """Return (content_or_None, error_or_None). None content = file absent."""
+    token, gist_id = _gist_creds()
+    try:
+        r = requests.get(
+            f"{GIST_API}/{gist_id}", headers=_gist_headers(token), timeout=15
+        )
+        if r.status_code != 200:
+            return None, f"GitHub returned {r.status_code}: {r.text[:150]}"
+        f = r.json().get("files", {}).get(filename)
+        if not f:
+            return None, None
+        if f.get("truncated") and f.get("raw_url"):
+            rr = requests.get(
+                f["raw_url"], headers=_gist_headers(token), timeout=15
+            )
+            return rr.text, None
+        return f.get("content"), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _gist_put_file(filename, content):
+    """Return (ok, error_or_None)."""
+    token, gist_id = _gist_creds()
+    try:
+        r = requests.patch(
+            f"{GIST_API}/{gist_id}",
+            headers=_gist_headers(token),
+            json={"files": {filename: {"content": content if content.strip() else " "}}},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return False, f"GitHub returned {r.status_code}: {r.text[:150]}"
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def read_persistent_text(path):
+    """Local file first; if missing, restore it from the Gist. None if absent."""
+    st.session_state["_persist_unsafe"] = False
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    if persistence_enabled():
+        content, err = _gist_get_file(os.path.basename(path))
+        if err:
+            # Couldn't tell whether cloud data exists - block saves so an
+            # empty local state can never overwrite the real cloud copy.
+            st.session_state["_persist_unsafe"] = True
+            raise PersistenceError(err)
+        if content is not None:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return content
+    return None
+
+
+def write_persistent_text(path, text):
+    """Write locally and to the Gist (when configured)."""
+    if st.session_state.get("_persist_unsafe"):
+        raise PersistenceError(
+            "Cloud storage could not be reached a moment ago, so nothing was "
+            "saved (to avoid overwriting your stored data). Please try again."
+        )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    if persistence_enabled():
+        ok, err = _gist_put_file(os.path.basename(path), text)
+        if not ok:
+            raise PersistenceError(f"Saved locally, but the cloud backup failed: {err}")
+
+
+# --------------------------------------------------------------------------
 # Master list storage
 # --------------------------------------------------------------------------
 
@@ -404,19 +519,15 @@ def save_aliases_file(uploaded_file):
 
 def load_assumptions() -> str:
     """Load the admin's saved business assumptions text, if any."""
-    if os.path.exists(ASSUMPTIONS_FILE_PATH):
-        try:
-            with open(ASSUMPTIONS_FILE_PATH, "r", encoding="utf-8") as f:
-                return f.read().strip()
-        except Exception:
-            return ""
-    return ""
+    try:
+        return (read_persistent_text(ASSUMPTIONS_FILE_PATH) or "").strip()
+    except Exception:
+        return ""
 
 
 def save_assumptions(text: str):
-    """Persist the admin's business assumptions text to disk."""
-    with open(ASSUMPTIONS_FILE_PATH, "w", encoding="utf-8") as f:
-        f.write(text.strip())
+    """Persist the admin's business assumptions text."""
+    write_persistent_text(ASSUMPTIONS_FILE_PATH, text.strip())
 
 
 # --------------------------------------------------------------------------
@@ -426,71 +537,229 @@ def save_assumptions(text: str):
 # other admin-managed settings on disk.
 # --------------------------------------------------------------------------
 
-import json as _json  # local alias avoids shadowing the top-level json import
-import random
+def _hash_password(password: str, salt: str = None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), 120_000
+    ).hex()
+    return salt, digest
+
+
+def _set_password_fields(employee: dict, password: str):
+    salt, digest = _hash_password(password)
+    employee["salt"] = salt
+    employee["pw_hash"] = digest
+    employee.pop("code", None)  # drop the old plain-text 4-digit code
+
+
+def _verify_password(employee: dict, password: str) -> bool:
+    password = str(password).strip()
+    if employee.get("pw_hash"):
+        _, digest = _hash_password(password, employee.get("salt"))
+        return hmac.compare_digest(digest.encode(), str(employee["pw_hash"]).encode())
+    # Legacy account created with the old auto-generated 4-digit code.
+    return hmac.compare_digest(
+        str(employee.get("code", "")).strip().encode("utf-8"),
+        password.encode("utf-8"),
+    )
+
+
+def _validate_password(password: str) -> str:
+    password = (password or "").strip()
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+        )
+    return password
 
 
 def load_employees() -> list:
-    """Return the list of employee accounts: [{"name": ..., "code": ...}]."""
-    if os.path.exists(EMPLOYEES_FILE_PATH):
-        try:
-            with open(EMPLOYEES_FILE_PATH, "r", encoding="utf-8") as f:
-                data = _json.load(f)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
+    """Return the employee accounts: [{"name", "salt", "pw_hash"}, ...]."""
+    try:
+        text = read_persistent_text(EMPLOYEES_FILE_PATH)
+    except PersistenceError:
+        return []
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
     return []
 
 
 def save_employees(employees: list):
-    """Persist the employee account list to disk."""
-    with open(EMPLOYEES_FILE_PATH, "w", encoding="utf-8") as f:
-        _json.dump(employees, f, ensure_ascii=False, indent=2)
+    """Persist the employee account list (local disk + cloud backup)."""
+    write_persistent_text(
+        EMPLOYEES_FILE_PATH, json.dumps(employees, ensure_ascii=False, indent=2)
+    )
 
 
-def generate_unique_code(existing_employees: list) -> str:
-    """Generate a random 4-digit code not already used by another employee."""
-    used_codes = {e["code"] for e in existing_employees}
-    while True:
-        code = f"{random.randint(0, 9999):04d}"
-        if code not in used_codes:
-            return code
-
-
-def add_employee(name: str) -> str:
+def add_employee(name: str, password: str):
     """
-    Add a new employee with an auto-generated 4-digit code and persist it.
-    Returns the generated code. Raises ValueError if the name is blank,
-    already exists, or MAX_EMPLOYEES would be exceeded.
+    Add an employee with a password chosen by the admin. Raises ValueError
+    for a blank/duplicate name, a too-short password, or when
+    MAX_EMPLOYEES would be exceeded; PersistenceError if saving fails.
     """
     name = name.strip()
     if not name:
         raise ValueError("Employee name cannot be blank.")
+    password = _validate_password(password)
     employees = load_employees()
     if len(employees) >= MAX_EMPLOYEES:
         raise ValueError(f"Maximum of {MAX_EMPLOYEES} employees already reached.")
     if any(e["name"].strip().lower() == name.lower() for e in employees):
         raise ValueError(f'An employee named "{name}" already exists.')
-    code = generate_unique_code(employees)
-    employees.append({"name": name, "code": code})
+    employee = {"name": name}
+    _set_password_fields(employee, password)
+    employees.append(employee)
     save_employees(employees)
-    return code
+
+
+def set_employee_password(name: str, password: str):
+    """Change an existing employee's password."""
+    password = _validate_password(password)
+    employees = load_employees()
+    for e in employees:
+        if e["name"] == name:
+            _set_password_fields(e, password)
+            save_employees(employees)
+            return
+    raise ValueError(f'No employee named "{name}".')
 
 
 def remove_employee(name: str):
     """Remove an employee account by name and persist the change."""
-    employees = load_employees()
-    employees = [e for e in employees if e["name"] != name]
+    employees = [e for e in load_employees() if e["name"] != name]
     save_employees(employees)
 
 
-def check_employee_login(name: str, code: str):
-    """Return the employee dict if name+code match a stored account, else None."""
-    for e in load_employees():
-        if e["name"] == name and str(e["code"]) == str(code).strip():
+def check_employee_login(name: str, password: str):
+    """Return the employee dict if name+password match, else None."""
+    employees = load_employees()
+    for e in employees:
+        if e.get("name") == name and _verify_password(e, password):
+            if not e.get("pw_hash"):  # silently upgrade a legacy account
+                try:
+                    _set_password_fields(e, str(password).strip())
+                    save_employees(employees)
+                except Exception:
+                    pass
             return e
     return None
+
+
+# --------------------------------------------------------------------------
+# Learned choices: whenever an employee fixes an item during review (picks
+# one of the suggestions, or types the correct item number), the pairing
+# "text as written in the request -> item number" is remembered for good
+# and applied automatically to that exact text in every future request.
+# Shared by all employees; stored like the other settings (local + cloud).
+# --------------------------------------------------------------------------
+
+def normalize_learn_key(text) -> str:
+    """Normalize request text so trivial spelling/spacing variants match."""
+    t = str(text or "").lower()
+    t = re.sub(r"[\u064B-\u065F\u0670\u0640]", "", t)  # Arabic diacritics/tatweel
+    t = re.sub(r"[\u0623\u0625\u0622]", "\u0627", t)  # alef variants -> ا
+    t = t.replace("\u0649", "\u064A")  # ى -> ي
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _normalize_code(value) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if re.fullmatch(r"\d+\.0+", s):  # Excel numeric code read as 123.0
+        s = s.split(".")[0]
+    return s
+
+
+def _master_code_column(master_df: pd.DataFrame):
+    for col in master_df.columns:
+        c = str(col).lower()
+        if "code" in c or "\u0631\u0642\u0645" in c:
+            return col
+    return master_df.columns[0]
+
+
+def find_master_row_by_code(master_df: pd.DataFrame, code):
+    """Exact lookup of an item number in the master list. Returns row dict or None."""
+    target = _normalize_code(code).lower()
+    if not target or master_df is None or master_df.empty:
+        return None
+    code_col = _master_code_column(master_df)
+    col_norm = master_df[code_col].apply(lambda v: _normalize_code(v).lower())
+    hit = master_df[col_norm == target]
+    if len(hit) >= 1:
+        return hit.iloc[0].to_dict()
+    filled = master_df.fillna("").astype(str)
+    mask = filled.apply(
+        lambda row: any(_normalize_code(v).lower() == target for v in row), axis=1
+    )
+    hit = master_df[mask]
+    if len(hit) == 1:
+        return hit.iloc[0].to_dict()
+    return None
+
+
+def load_learned() -> dict:
+    try:
+        text = read_persistent_text(LEARNED_FILE_PATH)
+    except PersistenceError:
+        return {}
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_learned(data: dict):
+    write_persistent_text(
+        LEARNED_FILE_PATH, json.dumps(data, ensure_ascii=False, indent=2)
+    )
+
+
+def learn_choices(pairs, employee: str):
+    """pairs: list of (text_as_written, item_code). Saved in one write."""
+    if not pairs:
+        return
+    data = load_learned()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for text, code in pairs:
+        key = normalize_learn_key(text)
+        code = _normalize_code(code)
+        if not key or not code:
+            continue
+        prev = data.get(key, {})
+        same = prev.get("code") == code
+        data[key] = {
+            "text": str(text).strip(),
+            "code": code,
+            "count": (prev.get("count", 0) + 1) if same else 1,
+            "by": employee,
+            "updated": now,
+        }
+    save_learned(data)
+
+
+def lookup_learned_match(text, master_df, learned: dict):
+    """Return (master_row_dict, employee_name) for a remembered choice, else (None, None)."""
+    entry = learned.get(normalize_learn_key(text))
+    if not entry:
+        return None, None
+    row = find_master_row_by_code(master_df, entry.get("code", ""))
+    if row is None:
+        return None, None
+    return row, entry.get("by", "an employee")
 
 
 # --------------------------------------------------------------------------
@@ -1286,6 +1555,7 @@ def resolve_items(
     buried inside a very long master-list prompt.
     """
     pending = []  # list of {"kind": "resolved", "result": {...}} or {"kind": "ai", "payload": {...}}
+    learned = load_learned()  # choices employees confirmed in earlier requests
 
     def add_resolved(text, language, quantity, row, confidence, notes):
         pending.append(
@@ -1311,6 +1581,18 @@ def resolve_items(
         text = item.get("extracted_text", "")
         language = item.get("detected_language", "")
         requested_qty = item.get("quantity", "")
+        learned_row, learned_by = lookup_learned_match(text, master_df, learned)
+        if learned_row is not None:
+            add_resolved(
+                text,
+                language,
+                requested_qty,
+                learned_row,
+                "High",
+                f"Matched from a previously saved choice ({learned_by}).",
+            )
+            continue
+
         hits = find_alias_matches(text, aliases_df)
 
         if len(hits) == 1:
@@ -1604,22 +1886,60 @@ with tab_admin:
             height=100,
         )
         if st.button("Save assumptions"):
-            save_assumptions(assumptions_input)
-            st.success("Assumptions saved.")
+            try:
+                save_assumptions(assumptions_input)
+                st.success("Assumptions saved.")
+            except PersistenceError as e:
+                st.error(str(e))
+
+        st.divider()
+        st.subheader("Cloud storage (so nothing is forgotten)")
+        if persistence_enabled():
+            st.success(
+                "Cloud backup is ON: employees, passwords, learned choices "
+                "and assumptions survive app restarts."
+            )
+            if st.button("Test cloud storage"):
+                ok, err = _gist_put_file(
+                    "healthcheck.txt", datetime.now().isoformat()
+                )
+                if ok:
+                    st.success("Cloud storage works.")
+                else:
+                    st.error(f"Cloud storage failed: {err}")
+        else:
+            st.warning(
+                "Cloud backup is OFF. On Streamlit Cloud the local disk is "
+                "wiped on every restart, so employees and learned choices "
+                "will be lost. To fix it: create a SECRET gist at "
+                "gist.github.com (any file, e.g. employees.json containing "
+                "[]), create a classic GitHub token with only the 'gist' "
+                "scope, then add GITHUB_TOKEN and GIST_ID (the long id at "
+                "the end of the gist URL) to this app's Secrets."
+            )
 
         st.divider()
         st.subheader("Employee Logins")
         st.caption(
-            f"This tool is for internal staff only (max {MAX_EMPLOYEES} "
-            "accounts). Add each employee's name below to generate their "
-            "4-digit login code, then share that code with them directly - "
-            "there is no self-signup."
+            f"Internal staff only (max {MAX_EMPLOYEES} accounts). Choose each "
+            f"employee's name and password yourself (at least "
+            f"{MIN_PASSWORD_LENGTH} characters) and tell them directly - "
+            "there is no self-signup. Passwords are stored encrypted (hashed), "
+            "so use 'Change password' if one is forgotten."
         )
+        flash = st.session_state.pop("admin_flash", None)
+        if flash:
+            st.success(flash)
         current_employees = load_employees()
+        if st.session_state.get("_persist_unsafe"):
+            st.error(
+                "Cloud storage could not be read right now - reload the page "
+                "in a moment before changing employees."
+            )
         if current_employees:
             st.dataframe(
-                pd.DataFrame(current_employees).rename(
-                    columns={"name": "Name", "code": "4-digit code"}
+                pd.DataFrame(
+                    [{"Name": e["name"], "Password": "set"} for e in current_employees]
                 ),
                 hide_index=True,
             )
@@ -1634,30 +1954,90 @@ with tab_admin:
         else:
             with st.form("add_employee_form", clear_on_submit=True):
                 new_employee_name = st.text_input("New employee name")
+                new_employee_password = st.text_input("Password for this employee")
                 add_submitted = st.form_submit_button("Add employee")
             if add_submitted:
                 try:
-                    generated_code = add_employee(new_employee_name)
-                    st.success(
-                        f'Employee "{new_employee_name.strip()}" added. '
-                        f"Their login code is: **{generated_code}** "
-                        "(share it with them now - it won't be shown "
-                        "again here except in the table above)."
+                    add_employee(new_employee_name, new_employee_password)
+                    st.session_state["admin_flash"] = (
+                        f'Employee "{new_employee_name.strip()}" added and saved.'
                     )
                     st.rerun()
-                except ValueError as e:
+                except (ValueError, PersistenceError) as e:
                     st.error(str(e))
 
         if current_employees:
+            with st.form("change_password_form", clear_on_submit=True):
+                pw_employee = st.selectbox(
+                    "Change password for",
+                    options=[e["name"] for e in current_employees],
+                )
+                pw_new = st.text_input("New password")
+                pw_submitted = st.form_submit_button("Change password")
+            if pw_submitted:
+                try:
+                    set_employee_password(pw_employee, pw_new)
+                    st.session_state["admin_flash"] = (
+                        f'Password for "{pw_employee}" changed and saved.'
+                    )
+                    st.rerun()
+                except (ValueError, PersistenceError) as e:
+                    st.error(str(e))
+
             employee_to_remove = st.selectbox(
                 "Remove an employee",
                 options=[e["name"] for e in current_employees],
                 key="remove_employee_select",
             )
             if st.button("Remove selected employee"):
-                remove_employee(employee_to_remove)
-                st.success(f'Employee "{employee_to_remove}" removed.')
-                st.rerun()
+                try:
+                    remove_employee(employee_to_remove)
+                    st.session_state["admin_flash"] = (
+                        f'Employee "{employee_to_remove}" removed.'
+                    )
+                    st.rerun()
+                except PersistenceError as e:
+                    st.error(str(e))
+
+        st.divider()
+        st.subheader("Learned choices")
+        st.caption(
+            "Whenever an employee corrects an item during review (picks a "
+            "suggestion or types the right item number), it is remembered "
+            "here and applied automatically the next time the same text "
+            "appears in any request."
+        )
+        learned_all = load_learned()
+        if learned_all:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Text as written": v.get("text", k),
+                            "Item number": v.get("code", ""),
+                            "Times confirmed": v.get("count", 1),
+                            "By": v.get("by", ""),
+                            "Last updated": v.get("updated", ""),
+                        }
+                        for k, v in learned_all.items()
+                    ]
+                ),
+                hide_index=True,
+            )
+            key_to_forget = st.selectbox(
+                "Forget a learned choice",
+                options=list(learned_all.keys()),
+                format_func=lambda k: f'{learned_all[k].get("text", k)}  ->  {learned_all[k].get("code", "")}',
+            )
+            if st.button("Forget selected choice"):
+                try:
+                    learned_all.pop(key_to_forget, None)
+                    save_learned(learned_all)
+                    st.rerun()
+                except PersistenceError as e:
+                    st.error(str(e))
+        else:
+            st.caption("Nothing learned yet.")
     elif admin_password_input:
         st.error("Incorrect password.")
 
@@ -1674,26 +2054,29 @@ with tab_guest:
 
     if st.session_state["current_employee"] is None:
         employees = load_employees()
-        if not employees:
+        if not employees and st.session_state.get("_persist_unsafe"):
+            st.error(
+                "Could not reach cloud storage to load the employee list. "
+                "Please reload the page in a moment."
+            )
+        elif not employees:
             st.warning(
                 "No employee accounts exist yet. Please ask the "
                 "administrator to add one first (Admin tab)."
             )
         else:
-            st.info("Please log in with your name and 4-digit code.")
+            st.info("Please log in with your name and password.")
             login_name = st.selectbox(
                 "Your name", options=[e["name"] for e in employees]
             )
-            login_code = st.text_input(
-                "4-digit code", max_chars=4, type="password"
-            )
+            login_code = st.text_input("Password", type="password")
             if st.button("Log in"):
                 matched_employee = check_employee_login(login_name, login_code)
                 if matched_employee:
                     st.session_state["current_employee"] = login_name
                     st.rerun()
                 else:
-                    st.error("Incorrect code. Please try again.")
+                    st.error("Incorrect password. Please try again.")
         st.stop()
 
     col_who, col_logout = st.columns([4, 1])
@@ -1708,6 +2091,7 @@ with tab_guest:
                 "req_review_indices",
                 "req_review_done",
                 "req_raw_reading",
+                "req_notices",
             ):
                 st.session_state.pop(key, None)
             st.rerun()
@@ -1733,7 +2117,7 @@ with tab_guest:
         if guest_upload is not None and st.button("Process Request"):
             # Starting a fresh request always clears any previous
             # run's results/review state for this employee.
-            for key in ("req_results", "req_review_indices", "req_raw_reading"):
+            for key in ("req_results", "req_review_indices", "req_raw_reading", "req_notices"):
                 st.session_state.pop(key, None)
 
             status_placeholder = st.empty()
@@ -1789,6 +2173,7 @@ with tab_guest:
                         i for i, r in enumerate(results) if needs_review(r)
                     ]
                     st.session_state["req_raw_reading"] = raw_reading
+                    st.session_state["req_run_id"] = time.time_ns()
             except json.JSONDecodeError:
                 status_placeholder.empty()
                 st.error(
@@ -1814,76 +2199,100 @@ with tab_guest:
             review_indices = st.session_state.get("req_review_indices", [])
 
             if review_indices:
+                run_id = st.session_state.get("req_run_id", 0)
                 st.warning(
                     f"{len(review_indices)} item(s) need your review "
                     "before the results can be downloaded - the AI "
                     "wasn't confident about them."
                 )
-                with st.form("review_form"):
-                    choices = {}
-                    manual_texts = {}
-                    candidates_by_index = {}
-                    for idx in review_indices:
-                        r = results[idx]
-                        st.markdown(
-                            f"**{r.get('extracted_text', '(no text)')}** "
-                            f"&nbsp;·&nbsp; qty: {r.get('quantity', '')}"
+                choices = {}
+                manual_texts = {}
+                candidates_by_index = {}
+                for idx in review_indices:
+                    r = results[idx]
+                    st.markdown(
+                        f"**{r.get('extracted_text', '(no text)')}** "
+                        f"&nbsp;·&nbsp; qty: {r.get('quantity', '')}"
+                    )
+                    if r.get("notes"):
+                        st.caption(r["notes"])
+                    candidates = suggest_top_candidates(
+                        master_df, r.get("extracted_text", ""), top_n=5
+                    )
+                    candidates_by_index[idx] = candidates
+                    none_option = len(candidates) + 1
+
+                    def _format_option(opt_i, _candidates=candidates):
+                        if opt_i == 0:
+                            return "Keep the AI's current result as-is"
+                        if opt_i == len(_candidates) + 1:
+                            return "None of these - type the item number myself"
+                        row = _candidates[opt_i - 1]
+                        values = [str(v) for v in row.values() if str(v).strip()]
+                        return " — ".join(values[:3])
+
+                    # NOTE: deliberately NOT inside st.form - widgets in a
+                    # form don't rerun on change, so the typing box below
+                    # could never appear when "None of these" was picked.
+                    chosen = st.radio(
+                        "Choose the correct match",
+                        options=list(range(len(candidates) + 2)),
+                        format_func=_format_option,
+                        key=f"review_choice_{run_id}_{idx}",
+                    )
+                    choices[idx] = chosen
+                    if chosen == none_option:
+                        manual_texts[idx] = st.text_input(
+                            "Correct item number (leave blank to mark as no match)",
+                            key=f"review_manual_{run_id}_{idx}",
                         )
-                        if r.get("notes"):
-                            st.caption(r["notes"])
-                        candidates = suggest_top_candidates(
-                            master_df, r.get("extracted_text", ""), top_n=5
-                        )
-                        candidates_by_index[idx] = candidates
+                    st.divider()
 
-                        def _format_option(opt_i, _candidates=candidates):
-                            if opt_i == 0:
-                                return "Keep the AI's current result as-is"
-                            if opt_i == len(_candidates) + 1:
-                                return "None of these - write it in myself"
-                            row = _candidates[opt_i - 1]
-                            values = [str(v) for v in row.values() if str(v).strip()]
-                            return " — ".join(values[:3])
-
-                        num_options = len(candidates) + 2
-                        chosen = st.radio(
-                            "Choose the correct match",
-                            options=list(range(num_options)),
-                            format_func=_format_option,
-                            key=f"review_choice_{idx}",
-                        )
-                        choices[idx] = chosen
-                        if chosen == len(candidates) + 1:
-                            manual_texts[idx] = st.text_input(
-                                "Your correction (item name/code, or leave "
-                                "blank to mark as no match)",
-                                key=f"review_manual_{idx}",
-                            )
-                        st.divider()
-
-                    review_submitted = st.form_submit_button("Confirm & Continue")
-
-                if review_submitted:
+                if st.button("Confirm & Continue", key=f"review_confirm_{run_id}"):
+                    to_learn = []
+                    notices = []
                     for idx in review_indices:
                         chosen = choices[idx]
                         candidates = candidates_by_index[idx]
+                        written = results[idx].get("extracted_text", "")
                         if chosen == 0:
-                            # Keep the AI's result, but make clear a human
-                            # looked at it and chose to keep it as-is.
                             results[idx]["notes"] = (
                                 results[idx].get("notes", "")
                                 + " [Employee reviewed: kept as-is.]"
                             ).strip()
                         elif chosen == len(candidates) + 1:
                             manual_text = manual_texts.get(idx, "").strip()
-                            results[idx]["matched_master_row"] = None
-                            results[idx]["confidence"] = "Manual"
-                            results[idx]["notes"] = (
-                                f"Employee manual correction: {manual_text}"
-                                if manual_text
-                                else "Employee confirmed: no match in "
-                                "master list."
-                            )
+                            if not manual_text:
+                                results[idx]["matched_master_row"] = None
+                                results[idx]["confidence"] = "Manual"
+                                results[idx]["notes"] = (
+                                    "Employee confirmed: no match in master list."
+                                )
+                            else:
+                                row = find_master_row_by_code(master_df, manual_text)
+                                if row is not None:
+                                    results[idx]["matched_master_row"] = row
+                                    results[idx]["confidence"] = "High"
+                                    results[idx]["notes"] = (
+                                        "Employee typed this item number: "
+                                        f"{manual_text}."
+                                    )
+                                    to_learn.append((written, _pick_code_column(row)))
+                                else:
+                                    results[idx]["matched_master_row"] = {
+                                        _master_code_column(master_df): manual_text
+                                    }
+                                    results[idx]["confidence"] = "Manual"
+                                    results[idx]["notes"] = (
+                                        f'Employee typed "{manual_text}" - not '
+                                        "found in the master list."
+                                    )
+                                    notices.append(
+                                        f'"{manual_text}" is not in the master '
+                                        f'list (for "{written}"). It was used '
+                                        "as typed but NOT saved for next time - "
+                                        "please double-check it."
+                                    )
                         else:
                             chosen_row = candidates[chosen - 1]
                             results[idx]["matched_master_row"] = chosen_row
@@ -1892,11 +2301,23 @@ with tab_guest:
                                 "Employee manually selected this match "
                                 "during review."
                             )
+                            to_learn.append((written, _pick_code_column(chosen_row)))
+
+                    try:
+                        learn_choices(to_learn, st.session_state["current_employee"])
+                    except PersistenceError as e:
+                        notices.append(
+                            "Your choices were applied to this request but "
+                            f"could not be remembered for next time: {e}"
+                        )
+                    st.session_state["req_notices"] = notices
                     st.session_state["req_results"] = results
                     st.session_state["req_review_indices"] = []
                     st.rerun()
 
             else:
+                for _notice in st.session_state.get("req_notices", []):
+                    st.warning(_notice)
                 result_df = results_to_dataframe(results)
 
                 st.success(f"Found {len(result_df)} item(s).")
@@ -1937,6 +2358,7 @@ with tab_guest:
                         "req_results",
                         "req_review_indices",
                         "req_raw_reading",
+                        "req_notices",
                     ):
                         st.session_state.pop(key, None)
                     st.rerun()
